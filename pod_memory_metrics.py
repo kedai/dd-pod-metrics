@@ -8,6 +8,9 @@ from datadog_api_client import ApiClient, Configuration
 from datadog_api_client.v1.api.metrics_api import MetricsApi
 from dotenv import load_dotenv
 
+# Configuration constants
+ACTIVE_POD_WINDOW_SECONDS = 60  # Time window to consider a pod active (1 minute)
+
 def setup_datadog_client() -> ApiClient:
     """Initialize Datadog API client with credentials."""
     load_dotenv()
@@ -74,19 +77,29 @@ def get_pod_metrics(
     if namespace:
         tags.append(f"kube_namespace:{namespace}")
     if pod_name_filter:
+        # Simple tag filtering - let Datadog handle the wildcards
         tags.append(f"pod_name:{pod_name_filter}")
 
+    # Base tag filter with required tags
     tag_filter = "{" + ",".join(tags) + "}" if tags else "{*}"
 
-    # Query both memory and CPU metrics
+    # Query both memory and CPU metrics with max and avg
     metrics = {
-        "memory": f"max:kubernetes.memory.usage{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
+        "memory_max": f"max:kubernetes.memory.usage{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
+        "memory_avg": f"avg:kubernetes.memory.usage{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
         "memory_limit": f"max:kubernetes.memory.limits{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "cpu": f"max:kubernetes.cpu.usage.total{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "cpu_limit": f"max:kubernetes.cpu.limits{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}"
+        "memory_request": f"max:kubernetes.memory.requests{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
+        "cpu_max": f"max:kubernetes.cpu.usage.total{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
+        "cpu_avg": f"avg:kubernetes.cpu.usage.total{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
+        "cpu_limit": f"max:kubernetes.cpu.limits{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
+        "cpu_request": f"max:kubernetes.cpu.requests{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}"
     }
 
     print(f"Time range: {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Debug output to verify query construction
+    print(f"\nDebug: Example query with filters:")
+    print(f"Query: {metrics['memory_max']}")
 
     results = {}
     for metric_name, query in metrics.items():
@@ -177,13 +190,13 @@ def list_clusters(client: ApiClient) -> List[str]:
         query = "avg:kubernetes.cpu.usage.total{*} by {kube_cluster_name}"
         end = int(datetime.now().timestamp())
         start = end - 3600  # Last hour
-        
+
         result = api_instance.query_metrics(
             _from=start,
             to=end,
             query=query
         )
-        
+
         # Extract unique cluster names
         clusters = set()
         if result.series:
@@ -193,7 +206,7 @@ def list_clusters(client: ApiClient) -> List[str]:
                         cluster_name = tag.split(':', 1)[1]
                         if cluster_name and cluster_name.lower() != 'n/a':
                             clusters.add(cluster_name)
-        
+
         return sorted(list(clusters))
     except Exception as e:
         print(f"Warning: Failed to fetch clusters: {str(e)}")
@@ -208,14 +221,14 @@ def get_base_pod_name(pod_name: str) -> str:
         r'-[0-9]+$',                         # numbered: -1, -2, etc
         r'-[a-z0-9]{5,10}$'                 # other random suffixes
     ]
-    
+
     base_name = pod_name
     for pattern in patterns:
         match = re.search(pattern, base_name)
         if match:
             base_name = base_name[:match.start()]
             break
-    
+
     return base_name
 
 def main():
@@ -256,8 +269,12 @@ def main():
         # Get namespace filter
         namespace = input("\nEnter namespace to filter (press Enter for all namespaces): ").strip() or None
 
-        # Get pod name filter
-        pod_filter = input("\nEnter pod name pattern to filter (press Enter for all pods): ").strip() or None
+        # Get pod name filter with better guidance
+        print("\nEnter pod name pattern to filter. Examples:")
+        print("  podname-*            : Match all pods starting with 'podname-'")
+        print("  *some-suffix*  : Match pods containing 'some-suffix'")
+        print("  podname-xxx      : Match exact name 'podname-xxx'")
+        pod_filter = input("Pod name pattern (press Enter for all pods): ").strip() or None
 
         # Get sort preference
         sort_option = get_sort_option()
@@ -280,15 +297,19 @@ def main():
         )
 
         # Process and print results
-        if results.get('memory', {}).get('series'):
+        if results.get('memory_max', {}).get('series'):
             # Collect all pod data
             pod_data = []
             now = datetime.now()
 
-            # Process memory metrics
-            memory_data = {
+            # Process memory metrics (max and avg)
+            memory_max_data = {
                 (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results['memory']['series']
+                for series in results.get('memory_max', {}).get('series', [])
+            }
+            memory_avg_data = {
+                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+                for series in results.get('memory_avg', {}).get('series', [])
             }
 
             # Process memory limits
@@ -297,10 +318,20 @@ def main():
                 for series in results.get('memory_limit', {}).get('series', [])
             }
 
-            # Process CPU metrics
-            cpu_data = {
+            # Process memory requests
+            memory_request_data = {
                 (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('cpu', {}).get('series', [])
+                for series in results.get('memory_request', {}).get('series', [])
+            }
+
+            # Process CPU metrics (max and avg)
+            cpu_max_data = {
+                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+                for series in results.get('cpu_max', {}).get('series', [])
+            }
+            cpu_avg_data = {
+                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+                for series in results.get('cpu_avg', {}).get('series', [])
             }
 
             # Process CPU limits
@@ -309,7 +340,13 @@ def main():
                 for series in results.get('cpu_limit', {}).get('series', [])
             }
 
-            for (scope, tag_set), points in memory_data.items():
+            # Process CPU requests
+            cpu_request_data = {
+                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+                for series in results.get('cpu_request', {}).get('series', [])
+            }
+
+            for (scope, tag_set), points in memory_max_data.items():
                 if not points:
                     continue
 
@@ -324,15 +361,27 @@ def main():
                 namespace = tags.get('kube_namespace', 'unknown')
                 pod = tags.get('pod_name', 'unknown')
 
-                # Get the latest non-null memory value
-                memory_mb = None
-                for point in reversed(points):
-                    if point[1] is not None:
-                        memory_mb = point[1] / (1024 * 1024)  # Convert to MB
-                        break
+                # Get memory metrics
+                memory_max = None
+                memory_avg = None
+                if (scope, tag_set) in memory_max_data:
+                    for point in reversed(memory_max_data[(scope, tag_set)]):
+                        if point[1] is not None:
+                            memory_max = point[1] / (1024 * 1024)  # Convert to MB
+                            break
+                if (scope, tag_set) in memory_avg_data:
+                    for point in reversed(memory_avg_data[(scope, tag_set)]):
+                        if point[1] is not None:
+                            memory_avg = point[1] / (1024 * 1024)  # Convert to MB
+                            break
 
-                if memory_mb is None or memory_mb < threshold:
-                    continue
+                # Get memory request
+                memory_request = None
+                if (scope, tag_set) in memory_request_data:
+                    for point in reversed(memory_request_data[(scope, tag_set)]):
+                        if point[1] is not None:
+                            memory_request = point[1] / (1024 * 1024)  # Convert to MB
+                            break
 
                 # Get memory limit
                 memory_limit = None
@@ -342,12 +391,29 @@ def main():
                             memory_limit = point[1] / (1024 * 1024)  # Convert to MB
                             break
 
-                # Get CPU usage
-                cpu_usage = None
-                if (scope, tag_set) in cpu_data:
-                    for point in reversed(cpu_data[(scope, tag_set)]):
+                # Get the latest timestamp and CPU value
+                latest_cpu_timestamp = None
+                cpu_max = None
+                cpu_avg = None
+                if (scope, tag_set) in cpu_max_data:
+                    for point in reversed(cpu_max_data[(scope, tag_set)]):
                         if point[1] is not None:
-                            cpu_usage = point[1] / 1e9  # Convert nanoseconds to cores
+                            # Datadog timestamps are in seconds, need to convert from ms to s
+                            latest_cpu_timestamp = datetime.fromtimestamp(point[0] / 1000.0)
+                            cpu_max = point[1] / 1e9  # Convert nanoseconds to cores
+                            break
+                if (scope, tag_set) in cpu_avg_data:
+                    for point in reversed(cpu_avg_data[(scope, tag_set)]):
+                        if point[1] is not None:
+                            cpu_avg = point[1] / 1e9  # Convert nanoseconds to cores
+                            break
+
+                # Get CPU request
+                cpu_request = None
+                if (scope, tag_set) in cpu_request_data:
+                    for point in reversed(cpu_request_data[(scope, tag_set)]):
+                        if point[1] is not None:
+                            cpu_request = point[1]  # Already in cores
                             break
 
                 # Get CPU limit
@@ -361,16 +427,25 @@ def main():
                 # Calculate resource percentages
                 memory_percent = None
                 if memory_limit is not None and memory_limit > 0:
-                    memory_percent = (memory_mb / memory_limit) * 100
+                    memory_percent = (memory_max / memory_limit) * 100
 
                 cpu_percent = None
-                if cpu_usage is not None and cpu_limit is not None and cpu_limit > 0:
-                    cpu_percent = (cpu_usage / cpu_limit) * 100
+                if cpu_max is not None and cpu_limit is not None and cpu_limit > 0:
+                    cpu_percent = (cpu_max / cpu_limit) * 100
+
+                # Determine pod status based on recent CPU activity
+                # Consider a pod completed if no CPU activity within the configured window
+                status = "Completed"
+                if latest_cpu_timestamp:
+                    time_since_last_cpu = datetime.now() - latest_cpu_timestamp
+                    if time_since_last_cpu.total_seconds() < ACTIVE_POD_WINDOW_SECONDS:
+                        status = "Active"
 
                 pod_data.append((
                     cluster, namespace, pod,
-                    memory_mb, memory_percent,
-                    cpu_usage, cpu_percent
+                    memory_max, memory_avg, memory_request, memory_limit, memory_percent,
+                    cpu_max, cpu_avg, cpu_request, cpu_limit, cpu_percent,
+                    status
                 ))
 
             # Sort data based on user preference
@@ -381,9 +456,9 @@ def main():
                 sort_key = lambda x: x[3]
                 reverse = False
             elif sort_option == "CPU (high to low)":
-                sort_key = lambda x: x[5] if x[5] is not None else 0
+                sort_key = lambda x: x[7] if x[7] is not None else 0
             elif sort_option == "CPU (low to high)":
-                sort_key = lambda x: x[5] if x[5] is not None else float('inf')
+                sort_key = lambda x: x[7] if x[7] is not None else float('inf')
                 reverse = False
             elif sort_option == "Name":
                 sort_key = lambda x: x[2]
@@ -394,42 +469,67 @@ def main():
             pod_data.sort(key=sort_key, reverse=reverse)
 
             print("\nPod Resource Usage (including completed pods):")
-            print("=" * 180)  # Use = for top border
-            print(f"{'Namespace':<20} | {'Pod':<80} | {'Memory':<15} | {'CPU':<20} | {'Status':<10}")
-            print("-" * 180)  # Use - for header separator
+            print("=" * 240)
+            headers = [
+                ("Namespace", 20),
+                ("Pod", 60),
+                ("Memory", 60),
+                ("CPU", 60),
+                ("Status", 10)
+            ]
+
+            # Print header
+            header_line = " | ".join(f"{name:<{width}}" for name, width in headers)
+            print(header_line)
+
+            # Print subheader for Memory and CPU
+            subheader = (
+                f"{'':20} | "  # Namespace
+                f"{'':60} | "  # Pod
+                f"{'Max':15}{'Avg':15}{'Request':15}{'Limit':15} | "  # Memory columns
+                f"{'Max':15}{'Avg':15}{'Request':15}{'Limit':15} | "  # CPU columns
+                f"{'':10}"  # Status
+            )
+            print(subheader)
+            print("-" * 240)
 
             active_pods = 0
             completed_pods = 0
 
-            for _, namespace, pod, memory_mb, memory_pct, cpu, cpu_pct in pod_data:
-                # Get base pod name
+            for _, namespace, pod, memory_max, memory_avg, memory_req, memory_lim, memory_pct, cpu_max, cpu_avg, cpu_req, cpu_lim, cpu_pct, status in pod_data:
                 base_pod = get_base_pod_name(pod)
-                
-                # Format memory
-                memory_str = format_memory_size(memory_mb)
-                if memory_pct is not None:
-                    memory_str += f" ({memory_pct:.1f}%)"
 
-                # Format CPU
-                cpu_str = "N/A"
-                if cpu is not None:
-                    cpu_str = format_cpu(cpu * 1e9)  # Convert cores back to nanoseconds for formatting
-                    if cpu_pct is not None:
-                        cpu_str += f" ({cpu_pct:.1f}%)"
+                # Format memory values
+                memory_max_str = format_memory_size(memory_max) if memory_max is not None else "N/A"
+                memory_avg_str = format_memory_size(memory_avg) if memory_avg is not None else "N/A"
+                memory_req_str = format_memory_size(memory_req) if memory_req is not None else "No request"
+                memory_lim_str = format_memory_size(memory_lim) if memory_lim is not None else "No limit"
 
-                # Determine pod status based on CPU metrics
-                status = "Active" if cpu is not None else "Completed"
+                # Format CPU values
+                cpu_max_str = format_cpu(cpu_max * 1e9) if cpu_max is not None else "N/A"
+                cpu_avg_str = format_cpu(cpu_avg * 1e9) if cpu_avg is not None else "N/A"
+                cpu_req_str = format_cpu(cpu_req * 1e9) if cpu_req is not None else "No request"
+                cpu_lim_str = format_cpu(cpu_lim * 1e9) if cpu_lim is not None else "No limit"
+
+                # Format line
+                line = (
+                    f"{namespace:<20} | "
+                    f"{base_pod:<60} | "
+                    f"{memory_max_str:<15}{memory_avg_str:<15}{memory_req_str:<15}{memory_lim_str:<15} | "
+                    f"{cpu_max_str:<15}{cpu_avg_str:<15}{cpu_req_str:<15}{cpu_lim_str:<15} | "
+                    f"{status:<10}"
+                )
+                print(line)
+
                 if status == "Active":
                     active_pods += 1
                 else:
                     completed_pods += 1
 
-                print(f"{namespace:<20} | {base_pod:<80} | {memory_str:<15} | {cpu_str:<20} | {status:<10}")
-
-            print("=" * 180)  # Use = for bottom border
+            print("=" * 240)
             print(f"Total pods shown: {len(pod_data)} ({active_pods} active, {completed_pods} completed)")
             total_memory = sum(x[3] for x in pod_data)
-            total_cpu = sum(x[5] for x in pod_data if x[5] is not None)
+            total_cpu = sum(x[7] for x in pod_data if x[7] is not None)
             print(f"Total memory usage: {format_memory_size(total_memory)}")
             print(f"Total CPU usage: {format_cpu(total_cpu * 1e9)}")
 
@@ -440,7 +540,7 @@ def main():
             print(f"  Max: {format_memory_size(max(memory_values))}")
             print(f"  Average: {format_memory_size(sum(memory_values)/len(memory_values))}")
 
-            cpu_values = [x[5] for x in pod_data if x[5] is not None]
+            cpu_values = [x[7] for x in pod_data if x[7] is not None]
             if cpu_values:
                 print("CPU (active pods only):")
                 print(f"  Min: {format_cpu(min(cpu_values) * 1e9)}")
