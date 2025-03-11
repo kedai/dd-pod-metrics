@@ -15,9 +15,44 @@ This script queries Datadog API to fetch memory and CPU usage statistics for Kub
 - **Trade-off**: More code complexity for better user experience
 
 ### 3. Pod Status Detection
-- **Choice**: Using CPU metrics to determine pod status
-- **Why**: Most reliable way to detect truly active pods
-- **Trade-off**: May miss some edge cases but works for most scenarios
+- **Choice**: Using CPU activity within a configurable time window (default: 1 minute)
+- **Why**: Most reliable way to detect truly active pods, closely matching `kubectl top pods`
+- **Trade-off**: Balances real-time accuracy with metric collection delays
+- **Configuration**: Adjust `ACTIVE_POD_WINDOW_SECONDS` for different monitoring needs:
+  ```python
+  # For tighter real-time monitoring (default)
+  ACTIVE_POD_WINDOW_SECONDS = 60  # 1 minute
+  # For more lenient monitoring
+  ACTIVE_POD_WINDOW_SECONDS = 300  # 5 minutes
+  ```
+
+#### Pod Status Criteria
+1. **Active Pods**:
+   - Must have CPU metrics in Datadog
+   - Must have CPU activity within the configured window
+   - Typically includes infrastructure pods (webserver, scheduler, triggerer)
+
+2. **Completed Pods**:
+   - No CPU metrics available, or
+   - No CPU activity within the configured window
+   - Typically includes task pods that have finished running
+
+#### Window Size Trade-offs
+- **Shorter Window (e.g., 1 minute)**:
+  - More accurate real-time state
+  - Better alignment with `kubectl top pods`
+  - May miss pods if metric collection is delayed
+
+- **Longer Window (e.g., 5 minutes)**:
+  - Better handles metric collection delays
+  - Shows more historical activity
+  - May show completed pods as active longer
+
+The default 1-minute window was chosen because:
+1. Datadog's metric collection is typically < 1 minute
+2. Provides best alignment with `kubectl top pods`
+3. Accurately captures infrastructure pod status
+4. Minimizes false positives from completed task pods
 
 ### 4. Resource Calculations
 - **Choice**: Showing both peak and average usage
@@ -37,17 +72,6 @@ DD_API_KEY_ID=your_api_key_id_here    # The ID of your API key (for identificati
 DD_API_KEY=your_api_key_here          # The actual API key value (secret)
 DD_APP_KEY=your_app_key_here          # Your application key
 ```
-
-To get these credentials:
-1. **API Key & ID**: 
-   - Go to: Organization Settings → API Keys (https://app.datadoghq.com/organization-settings/api-keys)
-   - Create or use existing key
-   - Copy both the Key ID and Key value
-
-2. **Application Key**:
-   - Go to: Organization Settings → Application Keys (https://app.datadoghq.com/organization-settings/application-keys)
-   - Create new key
-   - Copy the key value (only shown once)
 
 ## Validation and Troubleshooting
 
@@ -73,6 +97,22 @@ To get these credentials:
 ## Metrics Used
 
 The script uses several key Kubernetes metrics from Datadog to provide comprehensive resource usage information:
+
+### Understanding Metric Collection Delays
+
+When querying Datadog for pod metrics, there can be delays between:
+1. When a pod is actually running in Kubernetes (what `kubectl top pods` shows)
+2. When those metrics appear in Datadog's API
+
+These delays occur due to:
+- Time needed for the Datadog agent to collect metrics
+- Processing and sending metrics to Datadog's servers
+- API availability delays
+
+The pod status detection window (`ACTIVE_POD_WINDOW_SECONDS`) helps handle these delays:
+- Default 1-minute window works well for most cases
+- Increase the window if you notice pods being marked as completed too early
+- Decrease the window if you need tighter real-time monitoring
 
 ### Memory Metrics
 1. `kubernetes.memory.usage`
@@ -124,7 +164,20 @@ The script will:
    - Memory usage (peak and average)
    - CPU utilization (peak and average)
    - Resource usage percentages
-   - Pod status (Active/Completed)
+   - Pod status (Active/Completed) based on recent CPU activity
+
+### Configuration
+
+The script's behavior can be customized through configuration constants:
+
+```python
+# At the top of pod_memory_metrics.py
+
+# Time window to consider a pod active (default: 1 minute)
+# Decrease for tighter real-time monitoring
+# Increase if experiencing metric collection delays
+ACTIVE_POD_WINDOW_SECONDS = 60
+```
 
 ### Example API Usage
 
@@ -157,4 +210,33 @@ results = get_pod_metrics(
 2. Rotate your keys periodically
 3. Use the principle of least privilege - create specific keys for specific uses
 4. Consider using environment variables or secrets management in production
+
+### Important Configuration Notes
+
+1. **Pod Status Detection Window**:
+   ```python
+   # Adjust this based on your task duration patterns
+   ACTIVE_POD_WINDOW_SECONDS = 60  # Default: 1 minute
+   ```
+   This ensures accurate:
+   - Task duration measurement
+   - Resource utilization patterns
+   - Completion status detection
+
+2. **Best Practices**:
+   - Start with shorter windows for more accurate real-time data
+   - Increase window size if tasks are being marked complete too early
+   - Consider metric collection delays in your environment
+   - Monitor both active and completed pod metrics
+
+#### Resource Behavior
+1. **Memory**
+   - Exceeding limit → Pod OOMKilled
+   - No limit → Can use all node memory (bad for other pods and more nodes required)
+   - Request → Scheduling minimum
+
+2. **CPU**
+   - Exceeding limit → Throttled (not killed)
+   - No limit → Can use all available CPU
+   - Request → Guaranteed minimum
 
