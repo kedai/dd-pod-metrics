@@ -426,44 +426,59 @@ def main():
 
                 # Calculate resource percentages
                 memory_percent = None
-                if memory_limit is not None and memory_limit > 0:
+                if memory_max is not None and memory_limit is not None and memory_limit > 0:
                     memory_percent = (memory_max / memory_limit) * 100
 
                 cpu_percent = None
                 if cpu_max is not None and cpu_limit is not None and cpu_limit > 0:
                     cpu_percent = (cpu_max / cpu_limit) * 100
 
-                # Determine pod status based on recent CPU activity
-                # Consider a pod completed if no CPU activity within the configured window
-                status = "Completed"
-                if latest_cpu_timestamp:
-                    time_since_last_cpu = datetime.now() - latest_cpu_timestamp
-                    if time_since_last_cpu.total_seconds() < ACTIVE_POD_WINDOW_SECONDS:
-                        status = "Active"
+                # Skip pods with no memory data or below threshold
+                if memory_max is None or memory_max < threshold:
+                    continue
 
-                pod_data.append((
-                    cluster, namespace, pod,
-                    memory_max, memory_avg, memory_request, memory_limit, memory_percent,
-                    cpu_max, cpu_avg, cpu_request, cpu_limit, cpu_percent,
-                    status
-                ))
+                # Skip pods with no recent CPU activity (older than ACTIVE_POD_WINDOW_SECONDS)
+                if latest_cpu_timestamp is None:
+                    continue
+
+                time_since_last_cpu = now - latest_cpu_timestamp
+                if time_since_last_cpu.total_seconds() > ACTIVE_POD_WINDOW_SECONDS:
+                    continue
+
+                # Add pod data
+                pod_data.append({
+                    'cluster': cluster,
+                    'namespace': namespace,
+                    'pod': pod,
+                    'memory_max': memory_max,
+                    'memory_avg': memory_avg or 0,
+                    'memory_request': memory_request or 0,
+                    'memory_limit': memory_limit or 0,
+                    'memory_percent': memory_percent or 0,
+                    'cpu_max': cpu_max or 0,
+                    'cpu_avg': cpu_avg or 0,
+                    'cpu_request': cpu_request or 0,
+                    'cpu_limit': cpu_limit or 0,
+                    'cpu_percent': cpu_percent or 0,
+                    'base_name': get_base_pod_name(pod)
+                })
 
             # Sort data based on user preference
             sort_key = None
             reverse = True
 
             if sort_option == "Memory (low to high)":
-                sort_key = lambda x: x[3]
+                sort_key = lambda x: x['memory_max']
                 reverse = False
             elif sort_option == "CPU (high to low)":
-                sort_key = lambda x: x[7] if x[7] is not None else 0
+                sort_key = lambda x: x['cpu_max'] if x['cpu_max'] is not None else 0
             elif sort_option == "CPU (low to high)":
-                sort_key = lambda x: x[7] if x[7] is not None else float('inf')
+                sort_key = lambda x: x['cpu_max'] if x['cpu_max'] is not None else float('inf')
                 reverse = False
             elif sort_option == "Name":
-                sort_key = lambda x: x[2]
+                sort_key = lambda x: x['base_name']
             else:  # Namespace
-                sort_key = lambda x: (x[1], x[3])
+                sort_key = lambda x: (x['namespace'], x['memory_max'])
                 reverse = True
 
             pod_data.sort(key=sort_key, reverse=reverse)
@@ -496,51 +511,49 @@ def main():
             active_pods = 0
             completed_pods = 0
 
-            for _, namespace, pod, memory_max, memory_avg, memory_req, memory_lim, memory_pct, cpu_max, cpu_avg, cpu_req, cpu_lim, cpu_pct, status in pod_data:
-                base_pod = get_base_pod_name(pod)
-
+            for pod in pod_data:
                 # Format memory values
-                memory_max_str = format_memory_size(memory_max) if memory_max is not None else "N/A"
-                memory_avg_str = format_memory_size(memory_avg) if memory_avg is not None else "N/A"
-                memory_req_str = format_memory_size(memory_req) if memory_req is not None else "No request"
-                memory_lim_str = format_memory_size(memory_lim) if memory_lim is not None else "No limit"
+                memory_max_str = format_memory_size(pod['memory_max']) if pod['memory_max'] is not None else "N/A"
+                memory_avg_str = format_memory_size(pod['memory_avg']) if pod['memory_avg'] is not None else "N/A"
+                memory_req_str = format_memory_size(pod['memory_request']) if pod['memory_request'] is not None else "No request"
+                memory_lim_str = format_memory_size(pod['memory_limit']) if pod['memory_limit'] is not None else "No limit"
 
                 # Format CPU values
-                cpu_max_str = format_cpu(cpu_max * 1e9) if cpu_max is not None else "N/A"
-                cpu_avg_str = format_cpu(cpu_avg * 1e9) if cpu_avg is not None else "N/A"
-                cpu_req_str = format_cpu(cpu_req * 1e9) if cpu_req is not None else "No request"
-                cpu_lim_str = format_cpu(cpu_lim * 1e9) if cpu_lim is not None else "No limit"
+                cpu_max_str = format_cpu(pod['cpu_max'] * 1e9) if pod['cpu_max'] is not None else "N/A"
+                cpu_avg_str = format_cpu(pod['cpu_avg'] * 1e9) if pod['cpu_avg'] is not None else "N/A"
+                cpu_req_str = format_cpu(pod['cpu_request'] * 1e9) if pod['cpu_request'] is not None else "No request"
+                cpu_lim_str = format_cpu(pod['cpu_limit'] * 1e9) if pod['cpu_limit'] is not None else "No limit"
 
                 # Format line
                 line = (
-                    f"{namespace:<20} | "
-                    f"{base_pod:<60} | "
+                    f"{pod['namespace']:<20} | "
+                    f"{pod['base_name']:<60} | "
                     f"{memory_max_str:<15}{memory_avg_str:<15}{memory_req_str:<15}{memory_lim_str:<15} | "
                     f"{cpu_max_str:<15}{cpu_avg_str:<15}{cpu_req_str:<15}{cpu_lim_str:<15} | "
-                    f"{status:<10}"
+                    f"{'Active' if pod['cpu_max'] is not None else 'Completed':<10}"
                 )
                 print(line)
 
-                if status == "Active":
+                if pod['cpu_max'] is not None:
                     active_pods += 1
                 else:
                     completed_pods += 1
 
             print("=" * 240)
             print(f"Total pods shown: {len(pod_data)} ({active_pods} active, {completed_pods} completed)")
-            total_memory = sum(x[3] for x in pod_data)
-            total_cpu = sum(x[7] for x in pod_data if x[7] is not None)
+            total_memory = sum(x['memory_max'] for x in pod_data)
+            total_cpu = sum(x['cpu_max'] for x in pod_data if x['cpu_max'] is not None)
             print(f"Total memory usage: {format_memory_size(total_memory)}")
             print(f"Total CPU usage: {format_cpu(total_cpu * 1e9)}")
 
             print("\nResource Distribution:")
             print("Memory (all pods):")
-            memory_values = [x[3] for x in pod_data]
+            memory_values = [x['memory_max'] for x in pod_data]
             print(f"  Min: {format_memory_size(min(memory_values))}")
             print(f"  Max: {format_memory_size(max(memory_values))}")
             print(f"  Average: {format_memory_size(sum(memory_values)/len(memory_values))}")
 
-            cpu_values = [x[7] for x in pod_data if x[7] is not None]
+            cpu_values = [x['cpu_max'] for x in pod_data if x['cpu_max'] is not None]
             if cpu_values:
                 print("CPU (active pods only):")
                 print(f"  Min: {format_cpu(min(cpu_values) * 1e9)}")
