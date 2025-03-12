@@ -3,6 +3,8 @@ import os
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
+import csv
+from io import StringIO
 
 from datadog_api_client import ApiClient, Configuration
 from datadog_api_client.v1.api.metrics_api import MetricsApi
@@ -52,6 +54,36 @@ def parse_datetime(dt_str: str) -> Optional[datetime]:
 
     return None
 
+def parse_relative_time(time_str: str) -> Optional[timedelta]:
+    """Parse relative time string (e.g., '5h', '7d', '30m')."""
+    if not time_str:
+        return None
+        
+    # Handle special case 'now'
+    if time_str.lower() == 'now':
+        return timedelta(0)
+
+    try:
+        # Extract number and unit
+        match = re.match(r'^(\d+)([hdm])$', time_str.lower())
+        if not match:
+            return None
+
+        amount = int(match.group(1))
+        unit = match.group(2)
+
+        if unit == 'h':
+            return timedelta(hours=amount)
+        elif unit == 'd':
+            return timedelta(days=amount)
+        elif unit == 'm':
+            return timedelta(minutes=amount)
+
+    except (ValueError, AttributeError):
+        return None
+
+    return None
+
 def get_pod_metrics(
     client: ApiClient,
     cluster_name: str = None,
@@ -67,54 +99,97 @@ def get_pod_metrics(
     api_instance = MetricsApi(client)
 
     # Set up time range
-    end_time = end_time or datetime.now()
-    start_time = start_time or (end_time - timedelta(hours=1))
+    now = datetime.now()
+    end_time = now  # Always use current time
+    start_time = start_time or (now - timedelta(hours=1))
 
-    # Build query string with tags
-    tags = []
-    if cluster_name:
-        tags.append(f"kube_cluster_name:{cluster_name}")
-    if namespace:
-        tags.append(f"kube_namespace:{namespace}")
-    if pod_name_filter:
-        # Simple tag filtering - let Datadog handle the wildcards
-        tags.append(f"pod_name:{pod_name_filter}")
+    # Validate time range
+    max_history = timedelta(days=7)
+    time_range = end_time - start_time
+    if time_range >= max_history + timedelta(minutes=1):  # Allow exactly 7d
+        raise ValueError(f"Time range too large. Maximum is 7 days (7d)")
 
-    # Base tag filter with required tags
-    tag_filter = "{" + ",".join(tags) + "}" if tags else "{*}"
-
-    # Query both memory and CPU metrics with max and avg
-    metrics = {
-        "memory_max": f"max:kubernetes.memory.usage{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "memory_avg": f"avg:kubernetes.memory.usage{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "memory_limit": f"max:kubernetes.memory.limits{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "memory_request": f"max:kubernetes.memory.requests{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "cpu_max": f"max:kubernetes.cpu.usage.total{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "cpu_avg": f"avg:kubernetes.cpu.usage.total{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "cpu_limit": f"max:kubernetes.cpu.limits{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}",
-        "cpu_request": f"max:kubernetes.cpu.requests{tag_filter} by {{kube_cluster_name,kube_namespace,pod_name}}"
-    }
+    # Split long time ranges into 24h chunks
+    time_chunks = []
+    current_start = start_time
+    while current_start < end_time:
+        chunk_end = min(current_start + timedelta(hours=24), end_time)
+        time_chunks.append((current_start, chunk_end))
+        current_start = chunk_end
 
     print(f"Time range: {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if len(time_chunks) > 1:
+        print(f"Splitting into {len(time_chunks)} chunks of 24h or less")
 
     # Debug output to verify query construction
     print(f"\nDebug: Example query with filters:")
-    print(f"Query: {metrics['memory_max']}")
+    print(f"Query: max:kubernetes.memory.usage{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}")
 
-    results = {}
-    for metric_name, query in metrics.items():
-        print(f"Querying {metric_name}...")
-        try:
-            result = api_instance.query_metrics(
-                _from=int(start_time.timestamp()),
-                to=int(end_time.timestamp()),
-                query=query
-            )
-            results[metric_name] = result.to_dict()
-        except Exception as e:
-            print(f"Warning: Failed to fetch {metric_name}: {str(e)}")
+    all_results = {}
+    for chunk_start, chunk_end in time_chunks:
+        print(f"\nQuerying chunk: {chunk_start.strftime('%Y-%m-%d %H:%M:%S')} to {chunk_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Convert to UTC timestamps for Datadog API
+        from_ts = int(chunk_start.timestamp())
+        to_ts = int(chunk_end.timestamp())
 
-    return results
+        # Add buffer for metric collection delay
+        if (now - chunk_end).total_seconds() < 300:  # If end time is within last 5 minutes
+            to_ts += 300  # Add 5 minute buffer for metric collection delay
+
+        for metric_name, query in {
+            "memory_max": f"max:kubernetes.memory.usage{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "memory_avg": f"avg:kubernetes.memory.usage{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "memory_limit": f"max:kubernetes.memory.limits{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "memory_request": f"max:kubernetes.memory.requests{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "cpu_max": f"max:kubernetes.cpu.usage.total{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "cpu_avg": f"avg:kubernetes.cpu.usage.total{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "cpu_limit": f"max:kubernetes.cpu.limits{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
+            "cpu_request": f"max:kubernetes.cpu.requests{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}"
+        }.items():
+            print(f"Querying {metric_name}...")
+            try:
+                result = api_instance.query_metrics(
+                    _from=from_ts,
+                    to=to_ts,
+                    query=query
+                )
+                
+                # Merge results
+                if metric_name not in all_results:
+                    all_results[metric_name] = result.to_dict()
+                else:
+                    # Merge series data
+                    existing_series = all_results[metric_name].get('series', [])
+                    new_series = result.to_dict().get('series', [])
+                    
+                    # Create lookup for existing series
+                    existing_lookup = {
+                        (s.get('scope', ''), tuple(sorted(s.get('tag_set', [])))): s
+                        for s in existing_series
+                    }
+                    
+                    # Merge new points into existing series or add new series
+                    for new_s in new_series:
+                        key = (new_s.get('scope', ''), tuple(sorted(new_s.get('tag_set', []))))
+                        if key in existing_lookup:
+                            # Merge points
+                            existing_points = existing_lookup[key].get('pointlist', [])
+                            new_points = new_s.get('pointlist', [])
+                            all_points = existing_points + new_points
+                            # Sort by timestamp and remove duplicates
+                            unique_points = list({p[0]: p for p in all_points}.values())
+                            unique_points.sort(key=lambda x: x[0])
+                            existing_lookup[key]['pointlist'] = unique_points
+                        else:
+                            existing_series.append(new_s)
+                    
+                    all_results[metric_name]['series'] = existing_series
+                    
+            except Exception as e:
+                print(f"Warning: Failed to fetch {metric_name}: {str(e)}")
+
+    return all_results
 
 def format_memory_size(size_mb: float) -> str:
     """Format memory size to a human-readable format."""
@@ -154,31 +229,39 @@ def get_sort_option() -> str:
 
 def get_datetime_range() -> Tuple[datetime, datetime]:
     """Get datetime range from user."""
-    print("\nEnter time range (formats: YYYY-MM-DD HH:MM, YYYY-MM-DD, HH:MM, MM-DD)")
-    print("Press Enter to use defaults (last hour)")
+    print("\nEnter relative time range (e.g., 5h, 7d, 30m)")
+    print("Examples:")
+    print("  1h  = Last 1 hour")
+    print("  12h = Last 12 hours")
+    print("  1d  = Last 1 day")
+    print("  7d  = Last 7 days (maximum)")
+    print("  30m = Last 30 minutes")
+    print("Press Enter to use default (last hour)")
+
+    now = datetime.now()
+    max_history = timedelta(days=7)
 
     while True:
-        start_str = input("\nStart time (default: 1 hour ago): ").strip()
-        if not start_str:
-            return datetime.now() - timedelta(hours=1), datetime.now()
+        time_range = input("\nTime range (default: 1h): ").strip()
+        if not time_range:
+            time_range = "1h"
 
-        end_str = input("End time (default: now): ").strip()
-        if not end_str:
-            end_time = datetime.now()
-        else:
-            end_time = parse_datetime(end_str)
-            if not end_time:
-                print("Invalid end time format")
-                continue
-
-        start_time = parse_datetime(start_str)
-        if not start_time:
-            print("Invalid start time format")
+        delta = parse_relative_time(time_range)
+        if not delta:
+            print("Invalid time format. Use <number><unit> where unit is 'm' (minutes), 'h' (hours), or 'd' (days)")
+            print("Example: 12h, 7d, 30m")
             continue
 
-        if start_time >= end_time:
-            print("Start time must be before end time")
+        if delta >= max_history + timedelta(minutes=1):  # Allow exactly 7d
+            print(f"Time range too large. Maximum is 7 days (7d)")
             continue
+
+        if delta.total_seconds() < 60:  # At least 1 minute
+            print(f"Time range too small. Minimum is 1 minute (1m)")
+            continue
+
+        end_time = now
+        start_time = end_time - delta
 
         return start_time, end_time
 
@@ -279,6 +362,13 @@ def main():
         # Get sort preference
         sort_option = get_sort_option()
 
+        # Ask about saving to file
+        save_to_file = input("\nSave output to file? (y/N): ").strip().lower() == 'y'
+        output_file = None
+        if save_to_file:
+            default_filename = f"pod_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            output_file = input(f"Enter output filename (default: {default_filename}): ").strip() or default_filename
+
         print(f"\nFetching metrics for cluster: {cluster_name}")
         if namespace:
             print(f"Namespace filter: {namespace}")
@@ -297,146 +387,158 @@ def main():
         )
 
         # Process and print results
-        if results.get('memory_max', {}).get('series'):
-            # Collect all pod data
-            pod_data = []
-            now = datetime.now()
+        if not results.get('memory_max', {}).get('series'):
+            print("\nNo metrics found for the specified time range and filters.")
+            print("This could be because:")
+            print("1. No pods matched your filters")
+            print("2. No metrics were collected in the specified time range")
+            print("3. The time range is too far in the past (data retention limits)")
+            return
 
-            # Process memory metrics (max and avg)
-            memory_max_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('memory_max', {}).get('series', [])
+        # Collect all pod data
+        pod_data = []
+        now = datetime.now()
+
+        # Process memory metrics (max and avg)
+        memory_max_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('memory_max', {}).get('series', [])
+        }
+        memory_avg_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('memory_avg', {}).get('series', [])
+        }
+
+        # Process memory limits
+        memory_limit_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('memory_limit', {}).get('series', [])
+        }
+
+        # Process memory requests
+        memory_request_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('memory_request', {}).get('series', [])
+        }
+
+        # Process CPU metrics (max and avg)
+        cpu_max_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('cpu_max', {}).get('series', [])
+        }
+        cpu_avg_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('cpu_avg', {}).get('series', [])
+        }
+
+        # Process CPU limits
+        cpu_limit_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('cpu_limit', {}).get('series', [])
+        }
+
+        # Process CPU requests
+        cpu_request_data = {
+            (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
+            for series in results.get('cpu_request', {}).get('series', [])
+        }
+
+        for (scope, tag_set), points in memory_max_data.items():
+            if not points:
+                continue
+
+            # Extract tags
+            tags = {
+                tag.split(':', 1)[0]: tag.split(':', 1)[1]
+                for tag in tag_set
+                if ':' in tag
             }
-            memory_avg_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('memory_avg', {}).get('series', [])
-            }
 
-            # Process memory limits
-            memory_limit_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('memory_limit', {}).get('series', [])
-            }
+            cluster = tags.get('kube_cluster_name', 'unknown')
+            namespace = tags.get('kube_namespace', 'unknown')
+            pod = tags.get('pod_name', 'unknown')
 
-            # Process memory requests
-            memory_request_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('memory_request', {}).get('series', [])
-            }
+            # Get memory metrics
+            memory_max = None
+            memory_avg = None
+            if (scope, tag_set) in memory_max_data:
+                for point in reversed(memory_max_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        memory_max = point[1] / (1024 * 1024)  # Convert to MB
+                        break
+            if (scope, tag_set) in memory_avg_data:
+                for point in reversed(memory_avg_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        memory_avg = point[1] / (1024 * 1024)  # Convert to MB
+                        break
 
-            # Process CPU metrics (max and avg)
-            cpu_max_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('cpu_max', {}).get('series', [])
-            }
-            cpu_avg_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('cpu_avg', {}).get('series', [])
-            }
+            # Get memory request
+            memory_request = None
+            if (scope, tag_set) in memory_request_data:
+                for point in reversed(memory_request_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        memory_request = point[1] / (1024 * 1024)  # Convert to MB
+                        break
 
-            # Process CPU limits
-            cpu_limit_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('cpu_limit', {}).get('series', [])
-            }
+            # Get memory limit
+            memory_limit = None
+            if (scope, tag_set) in memory_limit_data:
+                for point in reversed(memory_limit_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        memory_limit = point[1] / (1024 * 1024)  # Convert to MB
+                        break
 
-            # Process CPU requests
-            cpu_request_data = {
-                (series.get('scope', 'unknown'), tuple(series.get('tag_set', []))): series.get('pointlist', [])
-                for series in results.get('cpu_request', {}).get('series', [])
-            }
+            # Get the latest timestamp and CPU value
+            latest_cpu_timestamp = None
+            cpu_max = None
+            cpu_avg = None
+            if (scope, tag_set) in cpu_max_data:
+                for point in reversed(cpu_max_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        # Datadog timestamps are in seconds, need to convert from ms to s
+                        latest_cpu_timestamp = datetime.fromtimestamp(point[0] / 1000.0)
+                        cpu_max = point[1] / 1e9  # Convert nanoseconds to cores
+                        break
+            if (scope, tag_set) in cpu_avg_data:
+                for point in reversed(cpu_avg_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        cpu_avg = point[1] / 1e9  # Convert nanoseconds to cores
+                        break
 
-            for (scope, tag_set), points in memory_max_data.items():
-                if not points:
-                    continue
+            # Get CPU request
+            cpu_request = None
+            if (scope, tag_set) in cpu_request_data:
+                for point in reversed(cpu_request_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        cpu_request = point[1]  # Already in cores
+                        break
 
-                # Extract tags
-                tags = {
-                    tag.split(':', 1)[0]: tag.split(':', 1)[1]
-                    for tag in tag_set
-                    if ':' in tag
-                }
+            # Get CPU limit
+            cpu_limit = None
+            if (scope, tag_set) in cpu_limit_data:
+                for point in reversed(cpu_limit_data[(scope, tag_set)]):
+                    if point[1] is not None:
+                        cpu_limit = point[1]  # Already in cores
+                        break
 
-                cluster = tags.get('kube_cluster_name', 'unknown')
-                namespace = tags.get('kube_namespace', 'unknown')
-                pod = tags.get('pod_name', 'unknown')
+            # Calculate resource percentages
+            memory_percent = None
+            if memory_max is not None and memory_limit is not None and memory_limit > 0:
+                memory_percent = (memory_max / memory_limit) * 100
 
-                # Get memory metrics
-                memory_max = None
-                memory_avg = None
-                if (scope, tag_set) in memory_max_data:
-                    for point in reversed(memory_max_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            memory_max = point[1] / (1024 * 1024)  # Convert to MB
-                            break
-                if (scope, tag_set) in memory_avg_data:
-                    for point in reversed(memory_avg_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            memory_avg = point[1] / (1024 * 1024)  # Convert to MB
-                            break
+            cpu_percent = None
+            if cpu_max is not None and cpu_limit is not None and cpu_limit > 0:
+                cpu_percent = (cpu_max / cpu_limit) * 100
 
-                # Get memory request
-                memory_request = None
-                if (scope, tag_set) in memory_request_data:
-                    for point in reversed(memory_request_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            memory_request = point[1] / (1024 * 1024)  # Convert to MB
-                            break
+            # Skip pods with no memory data or below threshold
+            if memory_max is None or memory_max < threshold:
+                continue
 
-                # Get memory limit
-                memory_limit = None
-                if (scope, tag_set) in memory_limit_data:
-                    for point in reversed(memory_limit_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            memory_limit = point[1] / (1024 * 1024)  # Convert to MB
-                            break
+            # For historical data (>1h), don't filter by CPU activity window
+            time_range = end_time - start_time
+            is_historical = time_range > timedelta(hours=1)
 
-                # Get the latest timestamp and CPU value
-                latest_cpu_timestamp = None
-                cpu_max = None
-                cpu_avg = None
-                if (scope, tag_set) in cpu_max_data:
-                    for point in reversed(cpu_max_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            # Datadog timestamps are in seconds, need to convert from ms to s
-                            latest_cpu_timestamp = datetime.fromtimestamp(point[0] / 1000.0)
-                            cpu_max = point[1] / 1e9  # Convert nanoseconds to cores
-                            break
-                if (scope, tag_set) in cpu_avg_data:
-                    for point in reversed(cpu_avg_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            cpu_avg = point[1] / 1e9  # Convert nanoseconds to cores
-                            break
-
-                # Get CPU request
-                cpu_request = None
-                if (scope, tag_set) in cpu_request_data:
-                    for point in reversed(cpu_request_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            cpu_request = point[1]  # Already in cores
-                            break
-
-                # Get CPU limit
-                cpu_limit = None
-                if (scope, tag_set) in cpu_limit_data:
-                    for point in reversed(cpu_limit_data[(scope, tag_set)]):
-                        if point[1] is not None:
-                            cpu_limit = point[1]  # Already in cores
-                            break
-
-                # Calculate resource percentages
-                memory_percent = None
-                if memory_max is not None and memory_limit is not None and memory_limit > 0:
-                    memory_percent = (memory_max / memory_limit) * 100
-
-                cpu_percent = None
-                if cpu_max is not None and cpu_limit is not None and cpu_limit > 0:
-                    cpu_percent = (cpu_max / cpu_limit) * 100
-
-                # Skip pods with no memory data or below threshold
-                if memory_max is None or memory_max < threshold:
-                    continue
-
+            if not is_historical:
                 # Skip pods with no recent CPU activity (older than ACTIVE_POD_WINDOW_SECONDS)
                 if latest_cpu_timestamp is None:
                     continue
@@ -445,46 +547,74 @@ def main():
                 if time_since_last_cpu.total_seconds() > ACTIVE_POD_WINDOW_SECONDS:
                     continue
 
-                # Add pod data
-                pod_data.append({
-                    'cluster': cluster,
-                    'namespace': namespace,
-                    'pod': pod,
-                    'memory_max': memory_max,
-                    'memory_avg': memory_avg or 0,
-                    'memory_request': memory_request or 0,
-                    'memory_limit': memory_limit or 0,
-                    'memory_percent': memory_percent or 0,
-                    'cpu_max': cpu_max or 0,
-                    'cpu_avg': cpu_avg or 0,
-                    'cpu_request': cpu_request or 0,
-                    'cpu_limit': cpu_limit or 0,
-                    'cpu_percent': cpu_percent or 0,
-                    'base_name': get_base_pod_name(pod)
-                })
+            # Add pod data
+            pod_data.append({
+                'cluster': cluster,
+                'namespace': namespace,
+                'pod': pod,
+                'memory_max': memory_max,
+                'memory_avg': memory_avg or 0,
+                'memory_request': memory_request or 0,
+                'memory_limit': memory_limit or 0,
+                'memory_percent': memory_percent or 0,
+                'cpu_max': cpu_max or 0,
+                'cpu_avg': cpu_avg or 0,
+                'cpu_request': cpu_request or 0,
+                'cpu_limit': cpu_limit or 0,
+                'cpu_percent': cpu_percent or 0,
+                'base_name': get_base_pod_name(pod)
+            })
 
-            # Sort data based on user preference
-            sort_key = None
+        # Sort data based on user preference
+        sort_key = None
+        reverse = True
+
+        if sort_option == "Memory (low to high)":
+            sort_key = lambda x: x['memory_max']
+            reverse = False
+        elif sort_option == "CPU (high to low)":
+            sort_key = lambda x: x['cpu_max'] if x['cpu_max'] is not None else 0
+        elif sort_option == "CPU (low to high)":
+            sort_key = lambda x: x['cpu_max'] if x['cpu_max'] is not None else float('inf')
+            reverse = False
+        elif sort_option == "Name":
+            sort_key = lambda x: x['base_name']
+        else:  # Namespace
+            sort_key = lambda x: (x['namespace'], x['memory_max'])
             reverse = True
 
-            if sort_option == "Memory (low to high)":
-                sort_key = lambda x: x['memory_max']
-                reverse = False
-            elif sort_option == "CPU (high to low)":
-                sort_key = lambda x: x['cpu_max'] if x['cpu_max'] is not None else 0
-            elif sort_option == "CPU (low to high)":
-                sort_key = lambda x: x['cpu_max'] if x['cpu_max'] is not None else float('inf')
-                reverse = False
-            elif sort_option == "Name":
-                sort_key = lambda x: x['base_name']
-            else:  # Namespace
-                sort_key = lambda x: (x['namespace'], x['memory_max'])
-                reverse = True
+        pod_data.sort(key=sort_key, reverse=reverse)
 
-            pod_data.sort(key=sort_key, reverse=reverse)
+        # Function to write output to console
+        def write_console(line):
+            print(line)
 
-            print("\nPod Resource Usage (including completed pods):")
-            print("=" * 240)
+        # Open output file if requested
+        output_fp = None
+        csv_writer = None
+        if output_file:
+            output_fp = open(output_file, 'w', newline='')
+            csv_writer = csv.writer(output_fp)
+            
+            # Write CSV metadata
+            metadata = [
+                ['Pod Resource Usage Report'],
+                ['Generated at', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+                ['Time range', f"{start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"],
+                ['Cluster', cluster_name],
+                ['Namespace filter', namespace or 'All'],
+                ['Pod name filter', pod_filter or 'All'],
+                ['Memory threshold (MB)', str(threshold)],
+                ['Sort by', sort_option],
+                [],  # Empty row for spacing
+            ]
+            csv_writer.writerows(metadata)
+
+        try:
+            # Console output header
+            write_console("\nPod Resource Usage (including completed pods):")
+            write_console("=" * 240)
+            
             headers = [
                 ("Namespace", 20),
                 ("Pod", 60),
@@ -493,11 +623,11 @@ def main():
                 ("Status", 10)
             ]
 
-            # Print header
+            # Print console header
             header_line = " | ".join(f"{name:<{width}}" for name, width in headers)
-            print(header_line)
+            write_console(header_line)
 
-            # Print subheader for Memory and CPU
+            # Print console subheader
             subheader = (
                 f"{'':20} | "  # Namespace
                 f"{'':60} | "  # Pod
@@ -505,62 +635,136 @@ def main():
                 f"{'Max':15}{'Avg':15}{'Request':15}{'Limit':15} | "  # CPU columns
                 f"{'':10}"  # Status
             )
-            print(subheader)
-            print("-" * 240)
+            write_console(subheader)
+            write_console("-" * 240)
+
+            # Write CSV headers
+            if csv_writer:
+                csv_headers = [
+                    'Namespace', 'Pod Name', 
+                    'Memory Max (MB)', 'Memory Avg (MB)', 'Memory Request (MB)', 'Memory Limit (MB)', 'Memory Utilization (%)',
+                    'CPU Max (cores)', 'CPU Avg (cores)', 'CPU Request (cores)', 'CPU Limit (cores)', 'CPU Utilization (%)',
+                    'Status'
+                ]
+                csv_writer.writerow(csv_headers)
 
             active_pods = 0
             completed_pods = 0
 
             for pod in pod_data:
-                # Format memory values
-                memory_max_str = format_memory_size(pod['memory_max']) if pod['memory_max'] is not None else "N/A"
-                memory_avg_str = format_memory_size(pod['memory_avg']) if pod['memory_avg'] is not None else "N/A"
-                memory_req_str = format_memory_size(pod['memory_request']) if pod['memory_request'] is not None else "No request"
-                memory_lim_str = format_memory_size(pod['memory_limit']) if pod['memory_limit'] is not None else "No limit"
+                # Get raw values for CSV
+                memory_max = pod['memory_max']
+                memory_avg = pod['memory_avg']
+                memory_request = pod['memory_request']
+                memory_limit = pod['memory_limit']
+                cpu_max = pod['cpu_max']
+                cpu_avg = pod['cpu_avg']
+                cpu_request = pod['cpu_request']
+                cpu_limit = pod['cpu_limit']
+                
+                # Calculate percentages
+                memory_percent = (memory_max / memory_limit * 100) if memory_max is not None and memory_limit and memory_limit > 0 else None
+                cpu_percent = (cpu_max / cpu_limit * 100) if cpu_max is not None and cpu_limit and cpu_limit > 0 else None
 
-                # Format CPU values
-                cpu_max_str = format_cpu(pod['cpu_max'] * 1e9) if pod['cpu_max'] is not None else "N/A"
-                cpu_avg_str = format_cpu(pod['cpu_avg'] * 1e9) if pod['cpu_avg'] is not None else "N/A"
-                cpu_req_str = format_cpu(pod['cpu_request'] * 1e9) if pod['cpu_request'] is not None else "No request"
-                cpu_lim_str = format_cpu(pod['cpu_limit'] * 1e9) if pod['cpu_limit'] is not None else "No limit"
+                # Format values for console display
+                memory_max_str = format_memory_size(memory_max) if memory_max is not None else "N/A"
+                memory_avg_str = format_memory_size(memory_avg) if memory_avg is not None else "N/A"
+                memory_req_str = format_memory_size(memory_request) if memory_request is not None else "No request"
+                memory_lim_str = format_memory_size(memory_limit) if memory_limit is not None else "No limit"
 
-                # Format line
-                line = (
+                cpu_max_str = format_cpu(cpu_max * 1e9) if cpu_max is not None else "N/A"
+                cpu_avg_str = format_cpu(cpu_avg * 1e9) if cpu_avg is not None else "N/A"
+                cpu_req_str = format_cpu(cpu_request * 1e9) if cpu_request is not None else "No request"
+                cpu_lim_str = format_cpu(cpu_limit * 1e9) if cpu_limit is not None else "No limit"
+
+                status = 'Active' if pod['cpu_max'] is not None else 'Completed'
+
+                # Format console line
+                console_line = (
                     f"{pod['namespace']:<20} | "
                     f"{pod['base_name']:<60} | "
                     f"{memory_max_str:<15}{memory_avg_str:<15}{memory_req_str:<15}{memory_lim_str:<15} | "
                     f"{cpu_max_str:<15}{cpu_avg_str:<15}{cpu_req_str:<15}{cpu_lim_str:<15} | "
-                    f"{'Active' if pod['cpu_max'] is not None else 'Completed':<10}"
+                    f"{status:<10}"
                 )
-                print(line)
+                write_console(console_line)
+
+                # Write CSV row with raw values
+                if csv_writer:
+                    csv_writer.writerow([
+                        pod['namespace'],
+                        pod['base_name'],
+                        f"{memory_max:.1f}" if memory_max is not None else "",
+                        f"{memory_avg:.1f}" if memory_avg is not None else "",
+                        f"{memory_request:.1f}" if memory_request is not None else "",
+                        f"{memory_limit:.1f}" if memory_limit is not None else "",
+                        f"{memory_percent:.1f}" if memory_percent is not None else "",
+                        f"{cpu_max:.3f}" if cpu_max is not None else "",
+                        f"{cpu_avg:.3f}" if cpu_avg is not None else "",
+                        f"{cpu_request:.3f}" if cpu_request is not None else "",
+                        f"{cpu_limit:.3f}" if cpu_limit is not None else "",
+                        f"{cpu_percent:.1f}" if cpu_percent is not None else "",
+                        status
+                    ])
 
                 if pod['cpu_max'] is not None:
                     active_pods += 1
                 else:
                     completed_pods += 1
 
-            print("=" * 240)
-            print(f"Total pods shown: {len(pod_data)} ({active_pods} active, {completed_pods} completed)")
-            total_memory = sum(x['memory_max'] for x in pod_data)
-            total_cpu = sum(x['cpu_max'] for x in pod_data if x['cpu_max'] is not None)
-            print(f"Total memory usage: {format_memory_size(total_memory)}")
-            print(f"Total CPU usage: {format_cpu(total_cpu * 1e9)}")
+            # Console summary
+            write_console("=" * 240)
+            write_console(f"Total pods shown: {len(pod_data)} ({active_pods} active, {completed_pods} completed)")
 
-            print("\nResource Distribution:")
-            print("Memory (all pods):")
-            memory_values = [x['memory_max'] for x in pod_data]
-            print(f"  Min: {format_memory_size(min(memory_values))}")
-            print(f"  Max: {format_memory_size(max(memory_values))}")
-            print(f"  Average: {format_memory_size(sum(memory_values)/len(memory_values))}")
+            if not pod_data:
+                write_console("\nNo pods found matching the criteria. This could be because:")
+                write_console("1. No pods exceeded the memory threshold")
+                write_console("2. No metrics were collected in the specified time range")
+                write_console("3. The time range is too far in the past (data retention limits)")
+            else:
+                total_memory = sum(x['memory_max'] for x in pod_data)
+                total_cpu = sum(x['cpu_max'] for x in pod_data if x['cpu_max'] is not None)
+                write_console(f"Total memory usage: {format_memory_size(total_memory)}")
+                write_console(f"Total CPU usage: {format_cpu(total_cpu * 1e9)}")
 
-            cpu_values = [x['cpu_max'] for x in pod_data if x['cpu_max'] is not None]
-            if cpu_values:
-                print("CPU (active pods only):")
-                print(f"  Min: {format_cpu(min(cpu_values) * 1e9)}")
-                print(f"  Max: {format_cpu(max(cpu_values) * 1e9)}")
-                print(f"  Average: {format_cpu(sum(cpu_values)/len(cpu_values) * 1e9)}")
-        else:
-            print("\nNo metrics data found for the specified filters")
+                # Write summary statistics
+                if csv_writer:
+                    csv_writer.writerows([
+                        [],  # Empty row for spacing
+                        ['Summary Statistics'],
+                        ['Total Pods', len(pod_data)],
+                        ['Active Pods', active_pods],
+                        ['Completed Pods', completed_pods],
+                        ['Total Memory Usage (MB)', f"{total_memory:.1f}"],
+                        ['Total CPU Usage (cores)', f"{total_cpu:.3f}"]
+                    ])
+
+                    # Resource distribution
+                    memory_values = [x['memory_max'] for x in pod_data]
+                    csv_writer.writerows([
+                        [],
+                        ['Memory Distribution (MB)'],
+                        ['Min', f"{min(memory_values):.1f}"],
+                        ['Max', f"{max(memory_values):.1f}"],
+                        ['Average', f"{sum(memory_values)/len(memory_values):.1f}"]
+                    ])
+
+                    cpu_values = [x['cpu_max'] for x in pod_data if x['cpu_max'] is not None]
+                    if cpu_values:
+                        csv_writer.writerows([
+                            [],
+                            ['CPU Distribution (cores)'],
+                            ['Min', f"{min(cpu_values):.3f}"],
+                            ['Max', f"{max(cpu_values):.3f}"],
+                            ['Average', f"{sum(cpu_values)/len(cpu_values):.3f}"]
+                        ])
+
+            if output_file:
+                write_console(f"\nData saved to: {output_file}")
+
+        finally:
+            if output_fp:
+                output_fp.close()
 
     except Exception as e:
         print(f"Error: {str(e)}")
