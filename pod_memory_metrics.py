@@ -135,15 +135,19 @@ def get_pod_metrics(
             to_ts += 300  # Add 5 minute buffer for metric collection delay
 
         # Build the tag filter
-        tag_filter = "*"
+        tag_filters = []
         if cluster_name:
-            tag_filter = f"kube_cluster_name:{cluster_name}"
+            tag_filters.append(f"kube_cluster_name:{cluster_name}")
         if namespace:
-            tag_filter = f"{tag_filter},kube_namespace:{namespace}" if tag_filter != "*" else f"kube_namespace:{namespace}"
+            tag_filters.append(f"kube_namespace:{namespace}")
         if pod_name_filter:
-            # Handle wildcard patterns in pod name filter
-            pod_filter = pod_name_filter.replace('*', '.*')
-            tag_filter = f"{tag_filter},pod_name:{pod_filter}" if tag_filter != "*" else f"pod_name:{pod_filter}"
+            tag_filters.append(f"pod_name:{pod_name_filter}")
+
+        # Combine filters with AND logic
+        tag_filter = ",".join(tag_filters) if tag_filters else "*"
+
+        # Debug output to verify query construction
+        print(f"\nDebug: Tag filter being used: {tag_filter}")
 
         for metric_name, metric_base in {
             "memory_max": "kubernetes.memory.usage",
@@ -366,9 +370,10 @@ def main():
 
         # Get pod name filter with better guidance
         print("\nEnter pod name pattern to filter. Examples:")
-        print("  podname-*            : Match all pods starting with 'podname-'")
-        print("  *some-suffix*  : Match pods containing 'some-suffix'")
-        print("  podname-xxx      : Match exact name 'podname-xxx'")
+        print("  podname*     : Match pods starting with 'podname'")
+        print("  *suffix      : Match pods ending with 'suffix'")
+        print("  *middle*     : Match pods containing 'middle'")
+        print("  exactname    : Match exact pod name")
         pod_filter = input("Pod name pattern (press Enter for all pods): ").strip() or None
 
         # Get sort preference
