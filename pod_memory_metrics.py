@@ -10,9 +10,6 @@ from datadog_api_client import ApiClient, Configuration
 from datadog_api_client.v1.api.metrics_api import MetricsApi
 from dotenv import load_dotenv
 
-# Configuration constants
-ACTIVE_POD_WINDOW_SECONDS = 60  # Time window to consider a pod active (1 minute)
-
 def setup_datadog_client() -> ApiClient:
     """Initialize Datadog API client with credentials."""
     load_dotenv()
@@ -137,16 +134,31 @@ def get_pod_metrics(
         if (now - chunk_end).total_seconds() < 300:  # If end time is within last 5 minutes
             to_ts += 300  # Add 5 minute buffer for metric collection delay
 
-        for metric_name, query in {
-            "memory_max": f"max:kubernetes.memory.usage{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "memory_avg": f"avg:kubernetes.memory.usage{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "memory_limit": f"max:kubernetes.memory.limits{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "memory_request": f"max:kubernetes.memory.requests{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "cpu_max": f"max:kubernetes.cpu.usage.total{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "cpu_avg": f"avg:kubernetes.cpu.usage.total{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "cpu_limit": f"max:kubernetes.cpu.limits{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}",
-            "cpu_request": f"max:kubernetes.cpu.requests{{*}} by {{kube_cluster_name,kube_namespace,pod_name}}"
+        # Build the tag filter
+        tag_filter = "*"
+        if cluster_name:
+            tag_filter = f"kube_cluster_name:{cluster_name}"
+        if namespace:
+            tag_filter = f"{tag_filter},kube_namespace:{namespace}" if tag_filter != "*" else f"kube_namespace:{namespace}"
+        if pod_name_filter:
+            # Handle wildcard patterns in pod name filter
+            pod_filter = pod_name_filter.replace('*', '.*')
+            tag_filter = f"{tag_filter},pod_name:{pod_filter}" if tag_filter != "*" else f"pod_name:{pod_filter}"
+
+        for metric_name, metric_base in {
+            "memory_max": "kubernetes.memory.usage",
+            "memory_avg": "kubernetes.memory.usage",
+            "memory_limit": "kubernetes.memory.limits",
+            "memory_request": "kubernetes.memory.requests",
+            "cpu_max": "kubernetes.cpu.usage.total",
+            "cpu_avg": "kubernetes.cpu.usage.total",
+            "cpu_limit": "kubernetes.cpu.limits",
+            "cpu_request": "kubernetes.cpu.requests"
         }.items():
+            # Build the full query with proper aggregation
+            agg = "max" if "max" in metric_name else "avg"
+            query = f"{agg}:{metric_base}{{{tag_filter}}} by {{kube_cluster_name,kube_namespace,pod_name}}"
+            
             print(f"Querying {metric_name}...")
             try:
                 result = api_instance.query_metrics(
@@ -534,19 +546,6 @@ def main():
             if memory_max is None or memory_max < threshold:
                 continue
 
-            # For historical data (>1h), don't filter by CPU activity window
-            time_range = end_time - start_time
-            is_historical = time_range > timedelta(hours=1)
-
-            if not is_historical:
-                # Skip pods with no recent CPU activity (older than ACTIVE_POD_WINDOW_SECONDS)
-                if latest_cpu_timestamp is None:
-                    continue
-
-                time_since_last_cpu = now - latest_cpu_timestamp
-                if time_since_last_cpu.total_seconds() > ACTIVE_POD_WINDOW_SECONDS:
-                    continue
-
             # Add pod data
             pod_data.append({
                 'cluster': cluster,
@@ -612,15 +611,14 @@ def main():
 
         try:
             # Console output header
-            write_console("\nPod Resource Usage (including completed pods):")
-            write_console("=" * 240)
+            write_console("\nPod Resource Usage:")
+            write_console("=" * 220)
             
             headers = [
                 ("Namespace", 20),
                 ("Pod", 60),
                 ("Memory", 60),
-                ("CPU", 60),
-                ("Status", 10)
+                ("CPU", 60)
             ]
 
             # Print console header
@@ -632,24 +630,19 @@ def main():
                 f"{'':20} | "  # Namespace
                 f"{'':60} | "  # Pod
                 f"{'Max':15}{'Avg':15}{'Request':15}{'Limit':15} | "  # Memory columns
-                f"{'Max':15}{'Avg':15}{'Request':15}{'Limit':15} | "  # CPU columns
-                f"{'':10}"  # Status
+                f"{'Max':15}{'Avg':15}{'Request':15}{'Limit':15}"  # CPU columns
             )
             write_console(subheader)
-            write_console("-" * 240)
+            write_console("-" * 220)
 
             # Write CSV headers
             if csv_writer:
                 csv_headers = [
                     'Namespace', 'Pod Name', 
                     'Memory Max (MB)', 'Memory Avg (MB)', 'Memory Request (MB)', 'Memory Limit (MB)', 'Memory Utilization (%)',
-                    'CPU Max (cores)', 'CPU Avg (cores)', 'CPU Request (cores)', 'CPU Limit (cores)', 'CPU Utilization (%)',
-                    'Status'
+                    'CPU Max (cores)', 'CPU Avg (cores)', 'CPU Request (cores)', 'CPU Limit (cores)', 'CPU Utilization (%)'
                 ]
                 csv_writer.writerow(csv_headers)
-
-            active_pods = 0
-            completed_pods = 0
 
             for pod in pod_data:
                 # Get raw values for CSV
@@ -677,15 +670,12 @@ def main():
                 cpu_req_str = format_cpu(cpu_request * 1e9) if cpu_request is not None else "No request"
                 cpu_lim_str = format_cpu(cpu_limit * 1e9) if cpu_limit is not None else "No limit"
 
-                status = 'Active' if pod['cpu_max'] is not None else 'Completed'
-
                 # Format console line
                 console_line = (
                     f"{pod['namespace']:<20} | "
                     f"{pod['base_name']:<60} | "
                     f"{memory_max_str:<15}{memory_avg_str:<15}{memory_req_str:<15}{memory_lim_str:<15} | "
-                    f"{cpu_max_str:<15}{cpu_avg_str:<15}{cpu_req_str:<15}{cpu_lim_str:<15} | "
-                    f"{status:<10}"
+                    f"{cpu_max_str:<15}{cpu_avg_str:<15}{cpu_req_str:<15}{cpu_lim_str:<15}"
                 )
                 write_console(console_line)
 
@@ -703,18 +693,12 @@ def main():
                         f"{cpu_avg:.3f}" if cpu_avg is not None else "",
                         f"{cpu_request:.3f}" if cpu_request is not None else "",
                         f"{cpu_limit:.3f}" if cpu_limit is not None else "",
-                        f"{cpu_percent:.1f}" if cpu_percent is not None else "",
-                        status
+                        f"{cpu_percent:.1f}" if cpu_percent is not None else ""
                     ])
 
-                if pod['cpu_max'] is not None:
-                    active_pods += 1
-                else:
-                    completed_pods += 1
-
             # Console summary
-            write_console("=" * 240)
-            write_console(f"Total pods shown: {len(pod_data)} ({active_pods} active, {completed_pods} completed)")
+            write_console("=" * 220)
+            write_console(f"Total pods shown: {len(pod_data)}")
 
             if not pod_data:
                 write_console("\nNo pods found matching the criteria. This could be because:")
@@ -733,8 +717,6 @@ def main():
                         [],  # Empty row for spacing
                         ['Summary Statistics'],
                         ['Total Pods', len(pod_data)],
-                        ['Active Pods', active_pods],
-                        ['Completed Pods', completed_pods],
                         ['Total Memory Usage (MB)', f"{total_memory:.1f}"],
                         ['Total CPU Usage (cores)', f"{total_cpu:.3f}"]
                     ])
