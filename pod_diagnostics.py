@@ -5,8 +5,6 @@ from typing import Dict, List, Optional
 import re
 import argparse
 import math
-import logging
-import sys
 
 from datadog_api_client import ApiClient, Configuration
 from datadog_api_client.v1.api.metrics_api import MetricsApi
@@ -47,15 +45,9 @@ def format_memory_size(size_bytes: float) -> str:
 
 class PodDiagnostics:
     def __init__(self):
-        """Initialize the pod diagnostics tool"""
-        # Initialize Datadog API client
         self.api_client = setup_datadog_client()
         self.metrics_api = MetricsApi(self.api_client)
         self.events_api = EventsApi(self.api_client)
-        
-        # Initialize attributes
-        self.cluster = None
-        self.namespace = None
 
     def format_cpu(self, nanocores: float) -> str:
         """Format CPU usage from nanocores to a human-readable string"""
@@ -176,42 +168,39 @@ class PodDiagnostics:
             else:
                 print(f"Warning: No {metric_type} series found")
                 
-                # Try fallback metrics if provided
-                if fallback_metrics:
-                    for fallback_metric in fallback_metrics:
-                        print(f"Trying fallback metric: {fallback_metric}")
-                        result = self._query_single_metric(
-                            fallback_metric, 
-                            metric_type, 
-                            cluster, 
-                            namespace, 
-                            pod_name, 
-                            start, 
-                            end
+            # Try fallback metrics if provided and primary metric failed
+            if fallback_metrics:
+                for fallback_metric in fallback_metrics:
+                    print(f"Trying fallback metric: {fallback_metric}")
+                    try:
+                        query = f"avg:{fallback_metric}{{kube_cluster_name:{cluster},kube_namespace:{namespace},pod_name:{pod_name}}}"
+                        response = self.metrics_api.query_metrics(
+                            _from=int(start.timestamp()),
+                            to=int(end.timestamp()),
+                            query=query
                         )
-                        if result:
-                            return result
+                        
+                        if response and hasattr(response, 'series') and response.series:
+                            series = response.series[0]
+                            points = series.pointlist
+                            if points:
+                                result = self._process_points(points)
+                                print(f"Found data using fallback metric: {fallback_metric}")
+                                return result
+                    except Exception as e:
+                        print(f"Error with fallback metric {fallback_metric}: {str(e)}")
+                        continue
 
         except Exception as e:
             print(f"Error querying {metric_type}: {str(e)}")
-            return None
+            print(f"Debug: Exception type: {type(e)}")
+            if hasattr(e, '__dict__'):
+                print(f"Debug: Exception details: {e.__dict__}")
 
-    def get_pod_events(self, pod_name: str, hours: int = 1, start_time=None, end_time=None) -> List[Dict]:
-        """Get recent events for the specified pod"""
-        if not self.api_client:
-            print("API client not initialized")
-            return []
+        return None
 
-        # Extract base task name for Airflow tasks (remove random suffix)
-        base_task_name = pod_name
-        if 'airflow' in pod_name.lower():
-            # Extract the base task name by removing the random suffix
-            match = re.search(r'(.*?)(?:-[a-z0-9]{4,})?$', pod_name)
-            if match:
-                base_task_name = match.group(1)
-                print(f"Extracted base task name: {base_task_name}")
-
-        # Set time window
+    def get_pod_events(self, cluster: str, namespace: str, pod_name: str, hours: int = 24, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> List[Dict]:
+        """Get recent events for the pod"""
         if start_time and end_time:
             start = start_time
             end = end_time
@@ -219,400 +208,77 @@ class PodDiagnostics:
             now = datetime.now()
             start = now - timedelta(hours=hours)
             end = now
-            
-        print(f"Searching for events between {start} and {end}")
 
-        # Convert to POSIX timestamps for the API
-        start_posix = int(start.timestamp())
-        end_posix = int(end.timestamp())
+        start_ts = int(start.timestamp())
+        end_ts = int(end.timestamp())
 
-        all_events = []
-        seen_event_ids = set()  # To track already seen events and avoid duplicates
-        
-        # Define search strategies in order of specificity
-        base_strategies = [
-            {
-                'name': 'Direct pod name match',
-                'query': f'pod_name:{pod_name}'
-            },
-            {
-                'name': 'Base task name match',
-                'query': f'pod_name:{pod_name}'
-            },
-            {
-                'name': 'Namespace + pod name in text',
-                'query': f'namespace:{self.namespace} {pod_name}'
-            },
-            {
-                'name': 'Cluster + pod name in text',
-                'query': f'cluster_name:{self.cluster} {pod_name}'
-            },
-            {
-                'name': 'Airflow task failure search',
-                'query': f'airflow task failed {pod_name}'
-            },
-            {
-                'name': 'Broad failure search',
-                'query': f'error OR failed OR exception {pod_name}'
-            },
-            {
-                'name': 'Airflow task failure (general)',
-                'query': f'airflow task failed'
-            },
-            {
-                'name': 'Task failure search (without pod name)',
-                'query': f'task failed namespace:{self.namespace}'
-            }
-        ]
-        
-        # Extract the task name from the pod name for more targeted searches
-        task_name_parts = pod_name.split('-')
-        if len(task_name_parts) > 3:
-            # Extract a more generic task name for searching
-            task_name = '-'.join(task_name_parts[:3])  # e.g., 'san-daily-transaction'
-            print(f"Extracted task name for searching: {task_name}")
-            
-            # Also try a more specific task name
-            specific_task_name = '-'.join(task_name_parts[:5])  # e.g., 'san-daily-transaction-san-emretl'
-            print(f"Extracted specific task name: {specific_task_name}")
-            
-            # Extract the DAG name (often the first part)
-            dag_name = task_name_parts[0]  # e.g., 'san'
-            print(f"Extracted DAG name: {dag_name}")
-        else:
-            task_name = pod_name
-            specific_task_name = pod_name
-            dag_name = pod_name.split('-')[0] if '-' in pod_name else pod_name
-            
-        # Add task-based search strategies
-        task_based_strategies = [
-            {
-                'name': 'Task name search (15:02 exact)',
-                'query': f'{task_name}',
-                'start_time': datetime(2025, 3, 24, 15, 2, 0),
-                'end_time': datetime(2025, 3, 24, 15, 3, 0)
-            },
-            {
-                'name': 'Task name with failure (15:00-15:05)',
-                'query': f'{task_name} AND (failed OR error OR exception)',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Specific task name search',
-                'query': f'{specific_task_name}',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Very wide time window for task',
-                'query': f'{task_name}',
-                'start_time': datetime(2025, 3, 24, 14, 45, 0),
-                'end_time': datetime(2025, 3, 24, 15, 15, 0)
-            }
-        ]
-        
-        # Add highly targeted search strategies for Airflow task failures
-        airflow_failure_strategies = [
-            {
-                'name': 'Airflow task failure (exact task)',
-                'query': f'airflow AND task AND failed AND {specific_task_name}',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Airflow task failure (DAG name)',
-                'query': f'airflow AND task AND failed AND {dag_name}',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Airflow task exception (exact task)',
-                'query': f'airflow AND task AND exception AND {specific_task_name}',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Generic failure search (15:02 exact)',
-                'query': f'failed OR error OR exception',
-                'start_time': datetime(2025, 3, 24, 15, 2, 0),
-                'end_time': datetime(2025, 3, 24, 15, 3, 0)
-            },
-            {
-                'name': 'Airflow operator failure',
-                'query': f'airflow AND operator AND failed',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Kubernetes pod failure',
-                'query': f'kubernetes AND pod AND failed AND {self.namespace}',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            }
-        ]
-        
-        # Add a specific targeted time search for the 15:02 event
-        target_time_strategies = [
-            {
-                'name': 'Targeted time search (15:02 exact)',
-                'query': f'pod_name:{pod_name}',
-                'start_time': datetime(2025, 3, 24, 15, 2, 0),
-                'end_time': datetime(2025, 3, 24, 15, 3, 0)
-            },
-            {
-                'name': 'Targeted time search (15:02 window)',
-                'query': f'pod_name:{pod_name}',
-                'start_time': datetime(2025, 3, 24, 15, 1, 0),
-                'end_time': datetime(2025, 3, 24, 15, 3, 0)
-            },
-            {
-                'name': 'Targeted time search (task failure)',
-                'query': f'task failed OR exception OR error',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Targeted time search (airflow task failure)',
-                'query': f'airflow task failed',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Targeted time search (broader window)',
-                'query': f'task failed OR exception OR error OR {pod_name}',
-                'start_time': datetime(2025, 3, 24, 14, 55, 0),
-                'end_time': datetime(2025, 3, 24, 15, 10, 0)
-            },
-            {
-                'name': 'Targeted namespace search',
-                'query': f'namespace:{self.namespace}',
-                'start_time': datetime(2025, 3, 24, 15, 0, 0),
-                'end_time': datetime(2025, 3, 24, 15, 5, 0)
-            },
-            {
-                'name': 'Wider time window search',
-                'query': f'pod_name:{pod_name}',
-                'start_time': datetime(2025, 3, 24, 14, 45, 0),
-                'end_time': datetime(2025, 3, 24, 15, 15, 0)
-            }
-        ]
-        
-        # Combine all search strategies
-        all_strategies = base_strategies + task_based_strategies + target_time_strategies + airflow_failure_strategies
-        
-        # Try each search strategy
-        for strategy in all_strategies:
-            try:
-                print(f"\nTrying search strategy: {strategy['name']}")
-                print(f"Query: {strategy['query']}")
-                
-                # Create the query parameters
-                if 'start_time' in strategy and 'end_time' in strategy:
-                    # Use strategy-specific time range
-                    start_ts = int(strategy['start_time'].timestamp())
-                    end_ts = int(strategy['end_time'].timestamp())
-                else:
-                    # Use default time range
-                    start_ts = start_posix
-                    end_ts = end_posix
-                
-                query_params = {
-                    'start': start_ts,
-                    'end': end_ts,
-                    'tags': strategy['query']
-                }
-                
-                # Make the API request
-                api_response = self.events_api.list_events(**query_params)
-                events = api_response.events if hasattr(api_response, 'events') else []
-            except Exception as e:
-                print(f"Error querying events with strategy '{strategy['name']}': {str(e)}")
-                if hasattr(e, 'body'):
-                    print(f"Error details: {e.body}")
-                events = []
-            
-            print(f"Found {len(events)} events")
-            
-            # Debug: Print the structure of the first event if available
-            if events and len(events) > 0:
-                first_event = events[0]
-                print("\nDEBUG - Event Structure:")
-                print(f"Event type: {type(first_event)}")
-                print(f"Event dir: {dir(first_event)}")
-                print(f"Event attributes:")
-                for attr in dir(first_event):
-                    if not attr.startswith('_'):
-                        try:
-                            value = getattr(first_event, attr)
-                            print(f"  {attr}: {value}")
-                        except Exception as e:
-                            print(f"  {attr}: Error accessing - {str(e)}")
-            
-            # Process and filter events
-            for event in events:
-                event_id = getattr(event, 'id', None)
-                
-                # Skip if we've already seen this event
-                if event_id in seen_event_ids:
-                    continue
-                
-                seen_event_ids.add(event_id)
-                
-                # Get event details
-                title = str(getattr(event, 'title', '')).lower()
-                text = str(getattr(event, 'text', '')).lower() if hasattr(event, 'text') else ''
-                
-                # Check if this event is relevant to our pod
-                is_relevant = False
-                
-                # Check if pod name is in title or text
-                if pod_name.lower() in title or pod_name.lower() in text:
-                    is_relevant = True
-                
-                # Check if base task name is in title or text (for Airflow tasks)
-                elif base_task_name.lower() in title or base_task_name.lower() in text:
-                    is_relevant = True
-                
-                # Check for Airflow task failure patterns
-                elif 'airflow' in title and ('task failed' in title or 'task failed' in text):
-                    is_relevant = True
-                
-                # Check for error/exception patterns that might be related
-                elif ('error' in title or 'exception' in title or 'failed' in title) and \
-                     (self.namespace and self.namespace.lower() in title or 
-                      self.namespace and self.namespace.lower() in text):
-                    is_relevant = True
-                
-                # If this event is relevant, add it to our list
-                if is_relevant:
-                    # Convert event object to dictionary
-                    event_dict = {
-                        'id': getattr(event, 'id', None),
-                        'title': getattr(event, 'title', ''),
-                        'text': getattr(event, 'text', ''),
-                        'date_happened': getattr(event, 'date_happened', None),
-                        'alert_type': getattr(event, 'alert_type', 'info'),
-                        'tags': getattr(event, 'tags', []),
-                        'source_type_name': getattr(event, 'source_type_name', '')
-                    }
-                    all_events.append(event_dict)
-                    
-                    # Special handling for events around 15:02
-                    timestamp = getattr(event, 'date_happened', None)
-                    if timestamp:
-                        event_time = datetime.fromtimestamp(timestamp)
-                        if datetime(2025, 3, 24, 15, 0) <= event_time <= datetime(2025, 3, 24, 15, 5):
-                            print(f"Found potential 15:02 event: {getattr(event, 'title', '')}")
-            
-            print(f"Found {len(events)} events, {len(all_events)} relevant so far")
-            
-        # Try targeted time searches
-        for strategy in target_time_strategies:
-            try:
-                print(f"\nTrying targeted time search strategy: {strategy['name']}")
-                print(f"Query: {strategy['query']}")
-                
-                # Create the query parameters
-                start_ts = int(strategy['start_time'].timestamp())
-                end_ts = int(strategy['end_time'].timestamp())
-                
-                query_params = {
-                    'start': start_ts,
-                    'end': end_ts,
-                    'tags': strategy['query']
-                }
-                
-                # Make the API request
-                api_response = self.events_api.list_events(**query_params)
-                events = api_response.events if hasattr(api_response, 'events') else []
-            except Exception as e:
-                print(f"Error in targeted time search: {str(e)}")
-                if hasattr(e, 'body'):
-                    print(f"Error details: {e.body}")
-                events = []
-            
-            print(f"Found {len(events)} events")
-            
-            # Process and filter events
-            for event in events:
-                event_id = getattr(event, 'id', None)
-                
-                # Skip if we've already seen this event
-                if event_id in seen_event_ids:
-                    continue
-                
-                seen_event_ids.add(event_id)
-                
-                # Convert event object to dictionary
-                event_dict = {
-                    'id': getattr(event, 'id', None),
-                    'title': getattr(event, 'title', ''),
-                    'text': getattr(event, 'text', ''),
-                    'date_happened': getattr(event, 'date_happened', None),
-                    'alert_type': getattr(event, 'alert_type', 'info'),
-                    'tags': getattr(event, 'tags', []),
-                    'source_type_name': getattr(event, 'source_type_name', '')
-                }
-                all_events.append(event_dict)
-                
-                # Special handling for events around 15:02
-                timestamp = getattr(event, 'date_happened', None)
-                if timestamp:
-                    event_time = datetime.fromtimestamp(timestamp)
-                    if datetime(2025, 3, 24, 15, 0) <= event_time <= datetime(2025, 3, 24, 15, 5):
-                        print(f"Found potential 15:02 event: {getattr(event, 'title', '')}")
-            
-            print(f"Found {len(events)} events, {len(all_events)} relevant so far")
-        
-        # If we still don't have many events, try a very broad search as a last resort
-        if len(all_events) < 3:
-            try:
-                print("\nTrying last resort broad search...")
-                broad_query = f"namespace:{self.namespace}"
-                
-                # Create the query parameters
-                query_params = {
-                    'start': start_posix,
-                    'end': end_posix,
-                    'tags': broad_query
-                }
-                
-                # Make the API request
-                api_response = self.events_api.list_events(**query_params)
-                events = api_response.events if hasattr(api_response, 'events') else []
-                
-                # Process and filter events
-                for event in events:
-                    event_id = getattr(event, 'id', None)
-                    
-                    # Skip if we've already seen this event
-                    if event_id in seen_event_ids:
-                        continue
-                    
-                    seen_event_ids.add(event_id)
-                    
-                    # Convert event object to dictionary
-                    event_dict = {
-                        'id': getattr(event, 'id', None),
-                        'title': getattr(event, 'title', ''),
-                        'text': getattr(event, 'text', ''),
-                        'date_happened': getattr(event, 'date_happened', None),
-                        'alert_type': getattr(event, 'alert_type', 'info'),
-                        'tags': getattr(event, 'tags', []),
-                        'source_type_name': getattr(event, 'source_type_name', '')
-                    }
-                    all_events.append(event_dict)
-                
-                print(f"Broad search found {len(events)} additional events")
-                
-            except Exception as e:
-                print(f"Error in broad search: {str(e)}")
-                if hasattr(e, 'body'):
-                    print(f"Error details: {e.body}")
-        
-        print(f"Total unique events found: {len(all_events)}")
-        return all_events
+        # Build minimal tag set for wider event capture
+        tags = [f"kube_cluster_name:{cluster}"]
+        if namespace:
+            tags.append(f"kube_namespace:{namespace}")
+
+        try:
+            tags_str = ",".join(tags)
+            response = self.events_api.list_events(
+                start=start_ts,
+                end=end_ts,
+                tags=tags_str,
+                unaggregated=True,
+                priority="normal",
+                page=0  # Changed from page_size=1000 to page=0 to get first page of results
+            )
+
+            if not hasattr(response, 'events'):
+                return []
+
+            # Filter events related to our pod, checking all possible fields
+            pod_events = []
+            for event in response.events:
+                # Safely get event attributes with fallbacks to empty string
+                event_attrs = [
+                    getattr(event, 'title', ''),
+                    getattr(event, 'text', ''),
+                    getattr(event, 'alert_type', ''),
+                    getattr(event, 'source_type_name', ''),
+                    # Safely handle tags
+                    *(getattr(event, 'tags', []) or [])
+                ]
+
+                # Filter out None values and convert to lowercase strings
+                event_text = " ".join(str(attr).lower() for attr in event_attrs if attr is not None)
+
+                # Check if this event is specifically about our pod
+                is_pod_event = False
+
+                # First check pod name in tags
+                pod_tags = [tag for tag in getattr(event, 'tags', []) or []
+                          if tag.startswith('pod_name:') or tag.startswith('kube_pod:')]
+                if any(pod_name in tag for tag in pod_tags):
+                    is_pod_event = True
+
+                # Then check title and text
+                if not is_pod_event:
+                    title = getattr(event, 'title', '').lower()
+                    text = getattr(event, 'text', '').lower()
+
+                    # Only match if pod name is explicitly mentioned
+                    is_pod_event = (
+                        f"pod {pod_name.lower()}" in title or
+                        f"pod {pod_name.lower()}" in text or
+                        f"pod/{pod_name.lower()}" in title or
+                        f"pod/{pod_name.lower()}" in text
+                    )
+
+                if is_pod_event:
+                    pod_events.append(event)
+
+            return pod_events
+
+        except Exception as e:
+            print(f"Error querying events: {e}")
+            if hasattr(e, 'body'):
+                print(f"Error body: {e.body}")
+            return []
 
     def find_matching_pods(self, cluster: str, namespace: str, pod_pattern: str, hours: int = 24, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> List[Dict]:
         """Find pods matching a pattern in the given namespace"""
@@ -675,7 +341,7 @@ class PodDiagnostics:
             print(f"Warning: Failed to search for pods: {str(e)}")
             return []
 
-    def select_pod(self, cluster: str, namespace: str, pod_pattern: str, hours: int = 24, start_time=None, end_time=None) -> Optional[str]:
+    def select_pod(self, cluster: str, namespace: str, pod_pattern: str, hours: int = 24, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> Optional[str]:
         """Interactive pod selection based on pattern matching"""
         while True:
             matching_pods = self.find_matching_pods(cluster, namespace, pod_pattern, hours, start_time, end_time)
@@ -730,37 +396,6 @@ class PodDiagnostics:
                 pod_pattern = choice
                 continue
 
-    def diagnose_pod(self, cluster: str, namespace: str, pod_name: str, hours: int = 1, start_time=None, end_time=None):
-        """Diagnose a pod by gathering metrics and events"""
-        print(f"\nDiagnosing pod: {pod_name}")
-        print(f"Cluster: {cluster}")
-        print(f"Namespace: {namespace}")
-        print(f"Time window: {hours} hour(s)")
-
-        # Set cluster and namespace for event retrieval
-        self.cluster = cluster
-        self.namespace = namespace
-        
-        # Get pod metrics
-        metrics = self.get_pod_metrics(cluster, namespace, pod_name, hours, start_time, end_time)
-
-        # Determine status from both events and metrics
-        events = self.get_pod_events(pod_name, hours, start_time, end_time)
-        event_status = self._determine_pod_status_from_events(events)
-        metric_status = self._determine_pod_status_from_metrics(metrics)
-
-        # Combine statuses
-        status = self._combine_statuses(event_status, metric_status)
-
-        # Display pod information
-        self.display_pod_info(pod_name, status)
-
-        # Display metrics
-        self.display_metrics(metrics)
-
-        # Display events
-        self.display_events(events)
-
     def run_diagnostics(self, cluster: str, namespace: str, pod_name: str, hours: int = 24, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None):
         """Run full diagnostics on a pod"""
         print(f"\nRunning diagnostics for pod: {pod_name}")
@@ -776,7 +411,7 @@ class PodDiagnostics:
         metrics = self.get_pod_metrics(cluster, namespace, pod_name, hours, start_time, end_time)
 
         # Determine status from both events and metrics
-        events = self.get_pod_events(pod_name, hours, start_time, end_time)
+        events = self.get_pod_events(cluster, namespace, pod_name, hours, start_time, end_time)
         event_status = self._determine_pod_status_from_events(events)
         metric_status = self._determine_pod_status_from_metrics(metrics)
 
@@ -808,10 +443,16 @@ class PodDiagnostics:
         print("╠" + "═" * 12 + "╬" + "═" * 15 + "╬" + "═" * 15 + "╬" + "═" * 15 + "╬" + "═" * 15 + "╬" + "═" * 15 + "╬" + "═" * 15 + "╬" + "═" * 31 + "╣")
 
         # Memory metrics
-        if 'memory' in metrics:
+        if 'memory' in metrics and metrics['memory'] is not None:
             memory = metrics['memory']
-            memory_limit = metrics.get('memory_limit', {}).get('current', 0)
-            memory_request = metrics.get('memory_request', {}).get('current', 0)
+            memory_limit = 0
+            memory_request = 0
+            
+            if 'memory_limit' in metrics and metrics['memory_limit'] is not None:
+                memory_limit = metrics['memory_limit'].get('current', 0)
+            
+            if 'memory_request' in metrics and metrics['memory_request'] is not None:
+                memory_request = metrics['memory_request'].get('current', 0)
 
             # Format memory values
             current = format_memory_size(memory['current'])
@@ -830,76 +471,42 @@ class PodDiagnostics:
                 utilization = "No activity"
 
             print(f"║ {'Memory':<12} ║ {current:<15} ║ {peak:<15} ║ {avg:<15} ║ {min_val:<15} ║ {request:<15} ║ {limit:<15} ║ {utilization:<31} ║")
+        else:
+            print(f"║ {'Memory':<12} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'No data available':<31} ║")
 
         # CPU metrics
-        if 'cpu' in metrics:
+        if 'cpu' in metrics and metrics['cpu'] is not None:
             cpu = metrics['cpu']
-            cpu_limit_data = metrics.get('cpu_limit', {})
-            cpu_request_data = metrics.get('cpu_request', {})
+            cpu_limit = 0
+            cpu_request = 0
+            
+            if 'cpu_limit' in metrics and metrics['cpu_limit'] is not None:
+                cpu_limit = metrics['cpu_limit'].get('current', 0)
+            
+            if 'cpu_request' in metrics and metrics['cpu_request'] is not None:
+                cpu_request = metrics['cpu_request'].get('current', 0)
 
-            # Check if we have valid CPU limit data
-            has_cpu_limit = cpu_limit_data and cpu_limit_data.get('current', 0) > 0
-            has_cpu_request = cpu_request_data and cpu_request_data.get('current', 0) > 0
-
-            # Format CPU values
+            # Format CPU values (nanocores)
             current = self.format_cpu(cpu['current'])
             peak = self.format_cpu(cpu['max'])
             avg = self.format_cpu(cpu['avg'])
             min_val = self.format_cpu(cpu['min'])
-            request = self.format_cpu(cpu_request_data.get('current', 0)) if has_cpu_request else "Not set"
-            limit = self.format_cpu(cpu_limit_data.get('current', 0)) if has_cpu_limit else "Not set"
+            request = self.format_cpu(cpu_request) if cpu_request > 0 else "Not set"
+            limit = self.format_cpu(cpu_limit) if cpu_limit > 0 else "Not set"
 
-            # Determine utilization string
-            utilization = "N/A"  # Default value
-            if all(v == 0 for v in [cpu['current'], cpu['max'], cpu['avg'], cpu['min']]):
-                utilization = "No activity"
-            elif not has_cpu_limit:  # No CPU limit set
-                utilization = "No limit set"
-            else:
-                # Convert everything to millicores for calculation
-                current_mcores = cpu['current'] / 1_000_000
-                peak_mcores = cpu['max'] / 1_000_000
-                limit_mcores = cpu_limit_data['current'] / 1_000_000
-
-                # Calculate utilization
-                util_current = min((current_mcores / limit_mcores) * 100, 100)
-                util_peak = min((peak_mcores / limit_mcores) * 100, 100)
+            utilization = "N/A"
+            if cpu_limit > 0:
+                util_current = (cpu['current'] / cpu_limit) * 100
+                util_peak = (cpu['max'] / cpu_limit) * 100
                 utilization = f"{util_current:.1f}% (peak: {util_peak:.1f}%)"
+            elif all(v == 0 for v in [cpu['current'], cpu['max'], cpu['avg'], cpu['min']]):
+                utilization = "No activity"
 
             print(f"║ {'CPU':<12} ║ {current:<15} ║ {peak:<15} ║ {avg:<15} ║ {min_val:<15} ║ {request:<15} ║ {limit:<15} ║ {utilization:<31} ║")
-
-        # Status
-        if 'status' in metrics:
-            status = metrics['status']
-            print("╟" + "─" * 12 + "╫" + "─" * 15 + "╫" + "─" * 15 + "╫" + "─" * 15 + "╫" + "─" * 15 + "╫" + "─" * 15 + "╫" + "─" * 15 + "╫" + "─" * 31 + "╢")
-            print(f"║ {'Status':<12} ║ {status:<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<31} ║")
+        else:
+            print(f"║ {'CPU':<12} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'N/A':<15} ║ {'No data available':<31} ║")
 
         print("╚" + "═" * 12 + "╩" + "═" * 15 + "╩" + "═" * 15 + "╩" + "═" * 15 + "╩" + "═" * 15 + "╩" + "═" * 15 + "╩" + "═" * 15 + "╩" + "═" * 31 + "╝")
-
-    def display_pod_info(self, pod_name: str, status: str):
-        """Display basic pod information and status"""
-        print("\n" + "=" * 100)
-        print(f"║ {'POD INFORMATION':^96} ║")
-        print("=" * 100)
-        
-        # Format status with color based on value
-        status_display = status
-        if status in ["Running", "Success", "Completed"]:
-            status_color = "green"
-        elif status in ["Warning"]:
-            status_color = "yellow"
-        elif status in ["Failed", "Error"]:
-            status_color = "red"
-        else:
-            status_color = "default"
-            
-        # Create the info table
-        headers = ["Pod Name", "Namespace", "Cluster", "Status"]
-        rows = [[pod_name, self.namespace, self.cluster, status]]
-        
-        # Print the table
-        self._print_table(headers, rows)
-        print("\n")
 
     def analyze_metrics(self, metrics: Dict) -> List[Dict]:
         """Analyze metrics and generate recommendations"""
@@ -909,88 +516,86 @@ class PodDiagnostics:
             return recommendations
 
         # CPU recommendations
-        if 'cpu' in metrics:
+        if 'cpu' in metrics and metrics['cpu'] is not None:
             cpu = metrics['cpu']
-            cpu_limit = metrics.get('cpu_limit', {}).get('current', 0)
+            cpu_limit = 0
+            
+            if 'cpu_limit' in metrics and metrics['cpu_limit'] is not None:
+                cpu_limit = metrics['cpu_limit'].get('current', 0)
 
-            if cpu_limit > 0:
-                # Convert to millicores for calculation
-                current_millicores = cpu['current'] / 1_000_000
-                peak_millicores = cpu['max'] / 1_000_000
-                avg_millicores = cpu['avg'] / 1_000_000
+            # Convert to millicores for calculation
+            current_millicores = cpu['current'] / 1_000_000
+            peak_millicores = cpu['max'] / 1_000_000
+            avg_millicores = cpu['avg'] / 1_000_000
 
-                # Calculate utilization percentages with safety checks
-                if all(v == 0 for v in [cpu['current'], cpu['max'], cpu['avg'], cpu['min']]):
-                    recommendations.append({
-                        'resource': 'CPU',
-                        'type': 'Info',
-                        'message': 'No CPU activity detected in the specified time window.'
-                    })
-                elif peak_millicores > 90:  # High utilization
-                    recommendations.append({
-                        'resource': 'CPU',
-                        'type': 'Warning',
-                        'message': f'High CPU utilization (current: {current_millicores:.1f}m, peak: {peak_millicores:.1f}m, avg: {avg_millicores:.1f}m). Consider increasing limits.'
-                    })
-                elif peak_millicores < 10:  # Very low utilization
-                    recommendations.append({
-                        'resource': 'CPU',
-                        'type': 'Info',
-                        'message': f'Low CPU utilization (peak: {peak_millicores:.1f}m). Consider reducing limits.'
-                    })
-                elif avg_millicores > 70:  # Sustained high utilization
-                    recommendations.append({
-                        'resource': 'CPU',
-                        'type': 'Info',
-                        'message': f'Sustained high CPU utilization (avg: {avg_millicores:.1f}m). Monitor for potential resource constraints.'
-                    })
-            else:
-                # No CPU limit set, show actual usage in millicores
-                avg_mcores = cpu['avg'] / 1_000_000
-                peak_mcores = cpu['max'] / 1_000_000
-                if avg_mcores > 0:
-                    recommendations.append({
-                        'resource': 'CPU',
-                        'type': 'Info',
-                        'message': f'No CPU limits set. Current usage: avg={self.format_cpu(cpu["avg"])}, peak={self.format_cpu(cpu["max"])}. Consider setting appropriate limits based on observed usage.'
-                    })
+            # Calculate utilization percentages with safety checks
+            if all(v == 0 for v in [cpu['current'], cpu['max'], cpu['avg'], cpu['min']]):
+                recommendations.append({
+                    'resource': 'CPU',
+                    'type': 'Info',
+                    'message': 'No CPU activity detected in the specified time window.'
+                })
+            elif peak_millicores > 90 and cpu_limit > 0:  # High utilization
+                recommendations.append({
+                    'resource': 'CPU',
+                    'type': 'Warning',
+                    'message': f'High CPU utilization (current: {current_millicores:.1f}m, peak: {peak_millicores:.1f}m, avg: {avg_millicores:.1f}m). Consider increasing limits.'
+                })
+            elif peak_millicores < 10 and cpu_limit > 0:  # Very low utilization
+                recommendations.append({
+                    'resource': 'CPU',
+                    'type': 'Info',
+                    'message': f'Low CPU utilization (peak: {peak_millicores:.1f}m). Consider reducing limits to optimize resource allocation.'
+                })
+            elif cpu_limit == 0:  # No CPU limit set
+                recommendations.append({
+                    'resource': 'CPU',
+                    'type': 'Info',
+                    'message': f'No CPU limit set. Current usage: {current_millicores:.1f}m, peak: {peak_millicores:.1f}m, avg: {avg_millicores:.1f}m.'
+                })
 
         # Memory recommendations
-        if 'memory' in metrics:
+        if 'memory' in metrics and metrics['memory'] is not None:
             memory = metrics['memory']
-            memory_limit = metrics.get('memory_limit', {}).get('current', 0)
+            memory_limit = 0
+            
+            if 'memory_limit' in metrics and metrics['memory_limit'] is not None:
+                memory_limit = metrics['memory_limit'].get('current', 0)
 
-            if memory_limit > 0:
-                current_util = (memory['current'] / memory_limit) * 100
+            # Memory usage in MB for readability
+            current_mb = memory['current'] / (1024 * 1024)
+            peak_mb = memory['max'] / (1024 * 1024)
+            avg_mb = memory['avg'] / (1024 * 1024)
+
+            if all(v == 0 for v in [memory['current'], memory['max'], memory['avg'], memory['min']]):
+                recommendations.append({
+                    'resource': 'Memory',
+                    'type': 'Info',
+                    'message': 'No memory activity detected in the specified time window.'
+                })
+            elif memory_limit > 0:
+                # Calculate utilization percentages
                 peak_util = (memory['max'] / memory_limit) * 100
                 avg_util = (memory['avg'] / memory_limit) * 100
 
-                if peak_util < 10:  # Very low utilization
-                    recommendations.append({
-                        'resource': 'Memory',
-                        'type': 'Info',
-                        'message': f'Low memory utilization (current: {current_util:.1f}%, peak: {peak_util:.1f}%). Consider reducing limits.'
-                    })
-                elif peak_util > 90:  # High utilization
+                if peak_util > 90:  # High utilization
                     recommendations.append({
                         'resource': 'Memory',
                         'type': 'Warning',
-                        'message': f'High memory utilization (peak: {peak_util:.1f}%). Consider increasing limits.'
+                        'message': f'High memory utilization (current: {current_mb:.1f}MB, peak: {peak_mb:.1f}MB, {peak_util:.1f}%). Consider increasing limits.'
                     })
-                elif avg_util > 70:  # Sustained high utilization
+                elif peak_util < 10:  # Very low utilization
                     recommendations.append({
                         'resource': 'Memory',
                         'type': 'Info',
-                        'message': f'Sustained high memory utilization (avg: {avg_util:.1f}%). Monitor for potential resource constraints.'
+                        'message': f'Low memory utilization (peak: {peak_util:.1f}%). Consider reducing limits to optimize resource allocation.'
                     })
-            else:
-                # No memory limit set, show actual usage
-                if memory['avg'] > 0:
-                    recommendations.append({
-                        'resource': 'Memory',
-                        'type': 'Warning',
-                        'message': f'No memory limits set. Peak usage: {format_memory_size(memory["max"])}. Consider setting appropriate limits.'
-                    })
+            else:  # No memory limit set
+                recommendations.append({
+                    'resource': 'Memory',
+                    'type': 'Info',
+                    'message': f'No memory limit set. Current usage: {current_mb:.1f}MB, peak: {peak_mb:.1f}MB, avg: {avg_mb:.1f}MB.'
+                })
 
         return recommendations
 
@@ -1005,7 +610,7 @@ class PodDiagnostics:
         rows = [[r['resource'], r['type'].title(), r['message']] for r in recommendations]
         print(tabulate(rows, headers=headers, tablefmt="double_grid"))
 
-    def display_events(self, events: List):
+    def display_events(self, events: List[Dict]):
         """Display pod events in a well-formatted table"""
         if not events:
             print("\nNo events found for the specified pod")
@@ -1013,275 +618,158 @@ class PodDiagnostics:
 
         print("\nRecent Events:")
         headers = ["Timestamp", "Type", "Title", "Status"]
-        
-        # Sort events by timestamp, newest first
-        sorted_events = sorted(
-            events,
-            key=lambda x: x.get('date_happened', 0),
-            reverse=True
-        )
-        
-        # Categorize events
-        failure_events = []
-        success_events = []
-        other_events = []
-        events_15_02 = []  # Special category for events around 15:02
-        
-        # Look for the specific 15:02 failure event
-        target_failure_event = None
-        
-        for event in sorted_events:
+        rows = []
+        for event in events[:5]:  # Show 5 most recent events for better context
             try:
                 # Safely get event attributes with fallbacks
                 timestamp = event.get('date_happened', None)
-                event_time = datetime.fromtimestamp(timestamp) if timestamp else None
-                timestamp_str = event_time.strftime('%Y-%m-%d %H:%M:%S') if event_time else "Unknown"
+                timestamp_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else "Unknown"
 
-                # Handle alert_type
-                alert_type = str(event.get('alert_type', 'info')).capitalize()
+                # Handle alert_type which is an enum or dict
+                alert_type = event.get('alert_type', 'info')
+                if isinstance(alert_type, dict):
+                    alert_type = alert_type.get('value', 'info')
+                alert_type = str(alert_type).capitalize()
 
+                # Get title and text safely
                 title = str(event.get('title', 'No title'))
                 text = str(event.get('text', '')).lower()
-                
+
                 # Determine event status
                 title_lower = title.lower()
                 status = 'Info'
-                
-                # Check if this event is in the 15:02 timeframe
-                is_target_timeframe = False
-                if event_time and (
-                    datetime(2025, 3, 24, 15, 1, 0) <= event_time <= datetime(2025, 3, 24, 15, 3, 0)
-                ):
-                    is_target_timeframe = True
-                    print(f"\nFound event in 15:02 timeframe: {timestamp_str}")
-                    print(f"Title: {title}")
-                    print(f"Text snippet: {text[:100]}..." if len(text) > 100 else f"Text: {text}")
-                
-                # Check for failure indicators in text or title
-                if ('error' in text or 'failed' in text or 'failure' in text or 'exception' in text or
-                    'error' in title_lower or 'failed' in title_lower or 'failure' in title_lower or
-                    'exception' in title_lower or 'traceback' in text):
+                if 'error' in text or 'failed' in text or 'error' in title_lower or 'failed' in title_lower:
                     status = 'Error'
-                    
-                    # Check if this is the 15:02 failure event
-                    if is_target_timeframe or (
-                        'task failed with exception' in text or
-                        'task failed with exception' in title_lower
-                    ):
-                        target_failure_event = {
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        }
-                        print(f"\nFound potential 15:02 failure event: {timestamp_str}")
-                        print(f"Title: {title}")
-                        print(f"Text snippet: {text[:100]}..." if len(text) > 100 else f"Text: {text}")
-                    else:
-                        failure_events.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
                 elif 'warning' in text or 'warning' in title_lower:
                     status = 'Warning'
-                    if is_target_timeframe:
-                        events_15_02.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
-                    else:
-                        other_events.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
-                elif 'success' in text or 'started' in text or 'running' in text or 'scheduled' in text:
+                elif 'success' in text or 'started' in text or 'running' in text:
                     status = 'Success'
-                    if is_target_timeframe:
-                        events_15_02.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
-                    else:
-                        success_events.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
-                else:
-                    if is_target_timeframe:
-                        events_15_02.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
-                    else:
-                        other_events.append({
-                            'timestamp': timestamp_str,
-                            'type': alert_type,
-                            'title': title[:80] + '...' if len(title) > 80 else title,
-                            'status': status,
-                            'full_event': event
-                        })
-            except Exception as e:
-                print(f"Error processing event: {str(e)}")
-                continue
-                
-        # Prepare display rows with priority ordering
-        display_rows = []
-        
-        # First add the target failure event if found
-        if target_failure_event:
-            display_rows.append([
-                target_failure_event['timestamp'],
-                target_failure_event['type'],
-                target_failure_event['title'],
-                target_failure_event['status']
-            ])
-            
-        # Then add other failure events
-        for event in failure_events:
-            display_rows.append([
-                event['timestamp'],
-                event['type'],
-                event['title'],
-                event['status']
-            ])
-            
-        # Then add success events
-        for event in success_events:
-            display_rows.append([
-                event['timestamp'],
-                event['type'],
-                event['title'],
-                event['status']
-            ])
-            
-        # Then add events from the 15:02 timeframe
-        for event in events_15_02:
-            display_rows.append([
-                event['timestamp'],
-                event['type'],
-                event['title'],
-                event['status']
-            ])
-            
-        # Finally add other events
-        for event in other_events:
-            display_rows.append([
-                event['timestamp'],
-                event['type'],
-                event['title'],
-                event['status']
-            ])
-            
-        # Limit to 10 events for display
-        display_rows = display_rows[:10]
-        
-        # Print the table
-        self._print_table(headers, display_rows)
-        
-        # If we found the target failure event, print its full details
-        if target_failure_event:
-            print("\nDetailed information for the failure event:")
-            print(f"Timestamp: {target_failure_event['timestamp']}")
-            print(f"Type: {target_failure_event['type']}")
-            print(f"Title: {target_failure_event['title']}")
-            print(f"Status: {target_failure_event['status']}")
-            print("\nFull event text:")
-            
-            # Get the full text of the event
-            full_event = target_failure_event['full_event']
-            
-            # Get the full text safely
-            full_text = str(full_event.get('text', ''))
-            
-            # Print the full text with line breaks
-            for line in full_text.split('\n'):
-                print(f"  {line}")
-        else:
-            print("\nNOTE: The specific task failure event at 15:02 was not found in the Datadog events.")
-            print("This could be because:")
-            print("1. The event wasn't captured by Datadog")
-            print("2. The event is outside the specified time window")
-            print("3. The event is not associated with the pod name or cluster in Datadog")
-            print("\nConsider checking the Airflow logs directly for more details.")
 
-    def _determine_pod_status_from_events(self, events: List) -> str:
-        """Determine pod status based on events"""
+                rows.append([
+                    timestamp_str,
+                    alert_type,
+                    title[:80] + '...' if len(title) > 80 else title,  # Truncate long titles
+                    status
+                ])
+            except Exception as e:
+                # Log any errors but continue processing other events
+                print(f"Warning: Error processing event: {str(e)}")
+                continue
+
+        if not rows:
+            print("No valid events found to display")
+            return
+
+        # Use double-line borders for better readability
+        print("╔" + "═" * 20 + "╦" + "═" * 10 + "╦" + "═" * 82 + "╦" + "═" * 10 + "╗")
+        print(f"║ {headers[0]:<20} ║ {headers[1]:<10} ║ {headers[2]:<82} ║ {headers[3]:<10} ║")
+        print("╠" + "═" * 20 + "╬" + "═" * 10 + "╬" + "═" * 82 + "╬" + "═" * 10 + "╣")
+
+        for row in rows:
+            print(f"║ {row[0]:<20} ║ {row[1]:<10} ║ {row[2]:<82} ║ {row[3]:<10} ║")
+
+        print("╚" + "═" * 20 + "╩" + "═" * 10 + "╩" + "═" * 82 + "╩" + "═" * 10 + "╝")
+
+        # Show detailed messages for events with additional context
+        print("\nDetailed Event Messages:")
+        for event in events[:5]:
+            try:
+                timestamp = event.get('date_happened', None)
+                timestamp_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else "Unknown"
+
+                alert_type = event.get('alert_type', 'info')
+                if isinstance(alert_type, dict):
+                    alert_type = alert_type.get('value', 'info')
+                alert_type = str(alert_type).capitalize()
+
+                title = str(event.get('title', 'No title'))
+                text = str(event.get('text', ''))
+
+                if text.lower() == 'none':
+                    text = None
+
+                print(f"\n[{timestamp_str} - {alert_type}]")
+                print(f"Title: {title}")
+                if text:
+                    print(f"Details: {text}")
+            except Exception as e:
+                print(f"Warning: Error displaying event details: {str(e)}")
+                continue
+
+    def _determine_pod_status_from_events(self, events: List[Dict]) -> str:
+        """Determine pod status from events"""
         if not events:
-            return "Unknown"
-        
-        # Check for error events first
-        for event in events:
-            # Safely get attributes using getattr with default values
-            title = str(event.get('title', '')).lower()
-            text = str(event.get('text', '')).lower()
-            
-            # Handle alert_type specially as it might be an enum
-            alert_type = str(event.get('alert_type', 'info')).lower()
-            
-            # Check for error indicators
-            if ('error' in text or 'failed' in text or 'failure' in text or 'exception' in text or
-                'error' in title or 'failed' in title or 'failure' in title or
-                'exception' in title or 'traceback' in text):
-                return "Error"
-        
-        # Check for warning events
-        for event in events:
-            # Safely get attributes using getattr with default values
-            title = str(event.get('title', '')).lower()
-            text = str(event.get('text', '')).lower()
-            
-            # Handle alert_type specially as it might be an enum
-            alert_type = str(event.get('alert_type', 'info')).lower()
-            
-            # Check for warning indicators
-            if ('warn' in text or 'warning' in text or
-                'warn' in title or 'warning' in title or
-                alert_type == 'warning'):
-                return "Warning"
-        
-        # Check for completion events
-        for event in events:
-            # Safely get attributes using getattr with default values
-            title = str(event.get('title', '')).lower()
-            text = str(event.get('text', '')).lower()
-            
-            # Check for completion indicators
-            if ('complete' in text or 'completed' in text or 'success' in text or
-                'complete' in title or 'completed' in title or 'success' in title):
-                return "Completed"
-        
-        # Check for running events
-        for event in events:
-            # Safely get attributes using getattr with default values
-            title = str(event.get('title', '')).lower()
-            text = str(event.get('text', '')).lower()
-            
-            # Check for running indicators
-            if ('running' in text or 'started' in text or
-                'running' in title or 'started' in title):
-                return "Running"
-        
-        # If we have events but couldn't determine a specific status, default to "Running"
-        return "Running"
+            return 'Unknown'
+
+        try:
+            # Sort events by date_happened in descending order (newest first)
+            sorted_events = sorted(
+                events,
+                key=lambda x: x.get('date_happened', 0),
+                reverse=True
+            )
+
+            # Look at the last 5 events to get better context
+            for event in sorted_events[:5]:
+                try:
+                    # Safely get event text and title
+                    text = str(event.get('text', '')).lower()
+                    title = str(event.get('title', '')).lower()
+
+                    # Handle alert_type which might be an enum or dict
+                    alert_type = event.get('alert_type', '')
+                    if isinstance(alert_type, dict):
+                        alert_type = alert_type.get('value', '')
+                    alert_type = str(alert_type).lower()
+
+                    full_text = f"{title} {text} {alert_type}"
+
+                    # Check for completion patterns first
+                    if any(pattern in full_text for pattern in [
+                        'exit code 0',
+                        'completed successfully',
+                        'task succeeded',
+                        'success',
+                        'completed',
+                        'task done',
+                        'finished'
+                    ]):
+                        return 'Completed'
+
+                    # Check for failure patterns
+                    if any(pattern in full_text for pattern in [
+                        'error',
+                        'failed',
+                        'crash',
+                        'exit code 1',
+                        'termination',
+                        'killed',
+                        'oomkilled'
+                    ]):
+                        return 'Failed'
+
+                    # Only consider a pod active if it has meaningful CPU activity
+                    # This prevents pods that are just starting up or shutting down
+                    # from being marked as active
+                    if any(pattern in full_text for pattern in [
+                        'started container',
+                        'created container',
+                        'assigned',
+                        'scheduled'
+                    ]):
+                        # Return Unknown to let metrics determine the actual status
+                        return 'Unknown'
+
+                except Exception as e:
+                    print(f"Warning: Error processing event for status detection: {str(e)}")
+                    continue
+
+            # If no definitive status found in events, check CPU metrics
+            return 'Unknown'
+
+        except Exception as e:
+            print(f"Warning: Error during status detection: {str(e)}")
+            return 'Unknown'
 
     def _determine_pod_status_from_metrics(self, metrics: Dict) -> str:
         """Determine pod status from metrics data"""
@@ -1292,7 +780,7 @@ class PodDiagnostics:
         if 'pod_status' in metrics:
             status = metrics['pod_status']
             current_phase = status.get('current', 'Unknown')
-            
+
             # Map Kubernetes pod phases to our status
             if current_phase == 'Running':
                 # For running pods, check CPU activity
@@ -1329,45 +817,28 @@ class PodDiagnostics:
 
         return 'Unknown'
 
-    def _combine_statuses(self, event_status, metric_status):
-        """Combine event and metric status to determine overall pod status"""
-        # If we have a definitive status from events, prioritize it
-        if event_status in ["Failed", "Error", "Warning"]:
-            return event_status
-        
-        # If metrics indicate the pod is running, but events don't contradict, use that
-        if metric_status == "Running" and event_status not in ["Failed", "Error", "Warning"]:
-            return "Running"
-        
-        # If metrics indicate the pod is completed, and events don't contradict, use that
-        if metric_status == "Completed" and event_status not in ["Failed", "Error", "Warning"]:
-            return "Completed"
-        
-        # If we have a success event, but metrics are inconclusive
-        if event_status == "Success" and metric_status == "Unknown":
-            return "Success"
-        
-        # Default to the metric status if we have it, otherwise use event status
-        return metric_status if metric_status != "Unknown" else event_status
-
-    def _print_table(self, headers, rows):
-        """Helper method to print a formatted table with the given headers and rows"""
-        if not rows:
-            print("No data to display")
-            return
-            
+    def _print_table(self, headers: List[str], rows: List[List[str]]):
+        """Print a table with double-line borders for better readability"""
         # Calculate column widths
-        col_widths = [20, 10, 82, 10]  # Default widths for timestamp, type, title, status
-        
-        # Use double-line borders for better readability
-        print("╔" + "═" * col_widths[0] + "╦" + "═" * col_widths[1] + "╦" + "═" * col_widths[2] + "╦" + "═" * col_widths[3] + "╗")
-        print(f"║ {headers[0]:<{col_widths[0]-2}} ║ {headers[1]:<{col_widths[1]-2}} ║ {headers[2]:<{col_widths[2]-2}} ║ {headers[3]:<{col_widths[3]-2}} ║")
-        print("╠" + "═" * col_widths[0] + "╬" + "═" * col_widths[1] + "╬" + "═" * col_widths[2] + "╬" + "═" * col_widths[3] + "╣")
+        widths = [max(len(str(row[i])) for row in [headers] + rows) for i in range(len(headers))]
 
+        # Top border
+        print("╔" + "╦".join("═" * (w + 2) for w in widths) + "╗")
+
+        # Headers
+        header_cells = [f" {str(headers[i]):<{widths[i]}} " for i in range(len(headers))]
+        print("║" + "║".join(header_cells) + "║")
+
+        # Header-data separator
+        print("╠" + "╬".join("═" * (w + 2) for w in widths) + "╣")
+
+        # Data rows
         for row in rows:
-            print(f"║ {row[0]:<{col_widths[0]-2}} ║ {row[1]:<{col_widths[1]-2}} ║ {row[2]:<{col_widths[2]-2}} ║ {row[3]:<{col_widths[3]-2}} ║")
+            cells = [f" {str(row[i]):<{widths[i]}} " for i in range(len(row))]
+            print("║" + "║".join(cells) + "║")
 
-        print("╚" + "═" * col_widths[0] + "╩" + "═" * col_widths[1] + "╩" + "═" * col_widths[2] + "╩" + "═" * col_widths[3] + "╝")
+        # Bottom border
+        print("╚" + "╩".join("═" * (w + 2) for w in widths) + "╝")
 
     def _process_points(self, points: List[float]) -> Dict[str, float]:
         """Process a list of metric points and return statistics"""
@@ -1448,9 +919,9 @@ class PodDiagnostics:
             cpu_request = metrics.get('cpu_request', {}).get('current', 0)
 
             # Convert to millicores for easier reading
-            current_millicores = cpu['current'] / 1_000_000
-            peak_millicores = cpu['max'] / 1_000_000
-            avg_millicores = cpu['avg'] / 1_000_000
+            current_mcores = cpu['current'] / 1_000_000
+            peak_mcores = cpu['max'] / 1_000_000
+            avg_mcores = cpu['avg'] / 1_000_000
 
             if all(v == 0 for v in [cpu['current'], cpu['max'], cpu['avg'], cpu['min']]):
                 recommendations.append({
@@ -1463,14 +934,14 @@ class PodDiagnostics:
                 recommendations.append({
                     'resource': 'CPU',
                     'type': 'Warning',
-                    'message': f'No CPU limits set. Current usage: {current_millicores:.1f}m (peak: {peak_millicores:.1f}m, avg: {avg_millicores:.1f}m). Consider setting limits based on peak usage.'
+                    'message': f'No CPU limits set. Current usage: {current_mcores:.1f}m (peak: {peak_mcores:.1f}m, avg: {avg_mcores:.1f}m). Consider setting limits based on peak usage.'
                 })
             else:
                 # Calculate utilization with safety checks
                 limit_mcores = cpu_limit / 1_000_000
                 if limit_mcores > 0:
-                    util_current = min((current_millicores / limit_mcores) * 100, 100)
-                    util_peak = min((peak_millicores / limit_mcores) * 100, 100)
+                    util_current = min((current_mcores / limit_mcores) * 100, 100)
+                    util_peak = min((peak_mcores / limit_mcores) * 100, 100)
 
                     if util_peak > 90:  # High utilization
                         recommendations.append({
@@ -1632,62 +1103,72 @@ def format_time_window(start_time: datetime, end_time: datetime) -> str:
         return f"{weeks} weeks"
 
 def main():
-    parser = argparse.ArgumentParser(description="Diagnose Kubernetes pod metrics and events")
-    parser.add_argument("--cluster", help="Kubernetes cluster name", required=True)
-    parser.add_argument("--namespace", help="Kubernetes namespace", required=True)
-    parser.add_argument("--pod-pattern", dest="pod_pattern", help="Pod name pattern to match", required=False)
-    parser.add_argument("--pod", help="Specific pod name to diagnose", required=False)
-    parser.add_argument("--hours", type=int, default=1, help="Hours of history to analyze")
-    parser.add_argument("--start-time", dest="start_time", help="Start time (YYYY-MM-DD HH:MM:SS)")
-    parser.add_argument("--end-time", dest="end_time", help="End time (YYYY-MM-DD HH:MM:SS)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser = argparse.ArgumentParser(description='Get pod metrics and diagnostics')
+    parser.add_argument('cluster', help='Kubernetes cluster name')
+    parser.add_argument('namespace', help='Kubernetes namespace')
+    parser.add_argument('pod_pattern', help='Pod name or pattern to match')
+
+    # Time window options with examples
+    time_group = parser.add_argument_group('Time window options')
+    time_group.add_argument('--hours', '-t', type=str,
+                           help='Time window (e.g., "24" or "24h" for hours, "7d" for days, "1w" for weeks)')
+    time_group.add_argument('--start-time', help='Start time in YYYY-MM-DD HH:MM format')
+    time_group.add_argument('--end-time', help='End time in YYYY-MM-DD HH:MM format (defaults to current time)')
 
     args = parser.parse_args()
 
-    # Configure logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-    # Parse time arguments if provided
+    # Handle time window
+    now = datetime.now()
     start_time = None
     end_time = None
+    hours = 24  # Default for relative time references
 
-    if args.start_time:
+    if args.start_time or args.end_time:
         try:
-            start_time = datetime.strptime(args.start_time, '%Y-%m-%d %H:%M:%S')
+            # If only end time is given, default start time to 24 hours before
+            if args.end_time and not args.start_time:
+                end_time = datetime.strptime(args.end_time, '%Y-%m-%d %H:%M')
+                start_time = end_time - timedelta(hours=24)
+            # If only start time is given, end time is now
+            elif args.start_time and not args.end_time:
+                start_time = datetime.strptime(args.start_time, '%Y-%m-%d %H:%M')
+                end_time = now
+            # Both times given
+            else:
+                start_time = datetime.strptime(args.start_time, '%Y-%m-%d %H:%M')
+                end_time = datetime.strptime(args.end_time, '%Y-%m-%d %H:%M')
+                if end_time < start_time:
+                    print("Error: End time must be after start time")
+                    return
+            # Calculate hours for compatibility with relative time functions
+            hours = max(1, int((end_time - start_time).total_seconds() / 3600))
         except ValueError:
-            print(f"Invalid start time format: {args.start_time}. Expected format: YYYY-MM-DD HH:MM:SS")
-            sys.exit(1)
-
-    if args.end_time:
-        try:
-            end_time = datetime.strptime(args.end_time, '%Y-%m-%d %H:%M:%S')
-        except ValueError:
-            print(f"Invalid end time format: {args.end_time}. Expected format: YYYY-MM-DD HH:MM:SS")
-            sys.exit(1)
-
-    # Set default time window if not specified
-    hours = args.hours
-    if not start_time and not end_time:
-        now = datetime.now()
-        end_time = now
-        start_time = now - timedelta(hours=hours)
+            print("Error: Time must be in YYYY-MM-DD HH:MM format")
+            return
+    else:
+        # Parse time window with units
+        if args.hours:
+            delta = parse_time_window(args.hours)
+            if not delta:
+                print("Error: Invalid time format. Examples: '24', '24h', '7d', '1w'")
+                return
+            hours = int(delta.total_seconds() / 3600)
+            start_time = now - timedelta(hours=hours)
+            end_time = now
+        else:
+            start_time = now - timedelta(hours=hours)
+            end_time = now
 
     diagnostics = PodDiagnostics()
-    diagnostics.cluster = args.cluster
-    diagnostics.namespace = args.namespace
 
     # First find and select the pod
-    if args.pod:
-        selected_pod = args.pod
-    else:
-        selected_pod = diagnostics.select_pod(args.cluster, args.namespace, args.pod_pattern, hours, start_time, end_time)
+    selected_pod = diagnostics.select_pod(args.cluster, args.namespace, args.pod_pattern, hours, start_time, end_time)
+    if not selected_pod:
+        print("No pod selected. Exiting.")
+        return
 
-    if selected_pod:
-        # Run diagnostics on the selected pod
-        diagnostics.diagnose_pod(args.cluster, args.namespace, selected_pod, hours, start_time, end_time)
-    else:
-        print("No pod selected for diagnostics")
+    # Run diagnostics with the time window
+    diagnostics.run_diagnostics(args.cluster, args.namespace, selected_pod, hours, start_time, end_time)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
