@@ -776,31 +776,16 @@ class PodDiagnostics:
         if not metrics:
             return 'Unknown'
 
-        # First check pod status from Kubernetes state metrics
+        # First check if we have explicit pod status
         if 'pod_status' in metrics:
             status = metrics['pod_status']
-            current_phase = status.get('current', 'Unknown')
-
-            # Map Kubernetes pod phases to our status
-            if current_phase == 'Running':
-                # For running pods, check CPU activity
-                if 'cpu' in metrics:
-                    cpu = metrics['cpu']
-                    current_cpu = cpu.get('current', 0)
-                    if current_cpu > 1_000_000:  # More than 1m CPU
-                        return 'Active'
-                    elif cpu.get('max', 0) > 0:
-                        return 'Completed'
+            if status.get('current', 0) == 1:
                 return 'Active'
-            elif current_phase == 'Succeeded':
+            elif status.get('current', 0) == 0:
                 return 'Completed'
-            elif current_phase in ['Failed', 'Unknown']:
-                return current_phase
-            elif current_phase == 'Pending':
-                return 'Pending'
 
         # Fall back to CPU metrics if no pod status
-        if 'cpu' in metrics:
+        if 'cpu' in metrics and metrics['cpu'] is not None:
             cpu = metrics['cpu']
             current_cpu = cpu.get('current', 0)
             if current_cpu > 1_000_000:  # More than 1m CPU
@@ -809,7 +794,7 @@ class PodDiagnostics:
                 return 'Completed'
 
         # Fall back to memory metrics
-        if 'memory' in metrics:
+        if 'memory' in metrics and metrics['memory'] is not None:
             memory = metrics['memory']
             current_memory = memory.get('current', 0)
             if current_memory > 0:
